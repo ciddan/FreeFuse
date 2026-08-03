@@ -267,6 +267,12 @@ class MultiAdapterBypassForwardHook:
         self.latent_size: Optional[Tuple[int, int]] = None  # (H, W) of latent
         self.mask_enabled: bool = False
         self.txt_len: int = 256  # Default Flux txt length (CLIP + T5)
+        # Token-position masking: adapter_name -> [[positions per batch], ...].
+        # Zeroes each LoRA's contribution at OTHER adapters' concept-token
+        # positions in the text segment (parity with the diffusers reference,
+        # freefuse_lora_layer.FreeFuseLinear.forward).
+        self.token_pos_maps: Optional[Dict[str, List[List[int]]]] = None
+        self._other_pos_cache: Dict[str, Optional[torch.Tensor]] = {}
         
         # LoRA enable/disable support (for Phase 1 mask collection)
         self.lora_enabled: bool = True
@@ -296,6 +302,8 @@ class MultiAdapterBypassForwardHook:
         new_obj.latent_size = copy.deepcopy(self.latent_size, memo)
         new_obj.mask_enabled = self.mask_enabled
         new_obj.txt_len = self.txt_len
+        new_obj.token_pos_maps = copy.deepcopy(self.token_pos_maps, memo)
+        new_obj._other_pos_cache = {}
         new_obj.lora_enabled = self.lora_enabled
         new_obj._should_apply_mask_cached = self._should_apply_mask_cached
         new_obj._mask_type_cached = self._mask_type_cached
@@ -341,26 +349,35 @@ class MultiAdapterBypassForwardHook:
         masks: Dict[str, torch.Tensor],
         latent_size: Tuple[int, int],
         txt_len: int = 256,
+        token_pos_maps: Optional[Dict[str, List[List[int]]]] = None,
     ):
         """
         Set FreeFuse masks for spatial LoRA application.
-        
+
         Args:
             masks: Dict mapping adapter_name -> spatial mask (H, W)
             latent_size: (H, W) of the latent space
             txt_len: Length of text tokens (for Flux: CLIP + T5 = 256)
+            token_pos_maps: Optional adapter_name -> token positions; when set,
+                each adapter's LoRA output is zeroed at other adapters'
+                positions in the text segment
         """
         self.masks = masks
         self.latent_size = latent_size
         self.mask_enabled = True
         self.txt_len = txt_len
-        logging.debug(f"[OffsetBypass] Set masks for {len(masks)} adapters, latent_size={latent_size}, txt_len={txt_len}")
-    
+        self.token_pos_maps = token_pos_maps
+        self._other_pos_cache = {}
+        logging.debug(f"[OffsetBypass] Set masks for {len(masks)} adapters, latent_size={latent_size}, txt_len={txt_len}, "
+                      f"token_pos_maps={'yes' if token_pos_maps else 'no'}")
+
     def clear_masks(self):
         """Disable mask application."""
         self.masks = None
         self.latent_size = None
         self.mask_enabled = False
+        self.token_pos_maps = None
+        self._other_pos_cache = {}
     
     def disable_lora(self):
         """Disable LoRA output (for Phase 1 mask collection)."""
@@ -464,15 +481,16 @@ class MultiAdapterBypassForwardHook:
         
         # Double stream blocks (double_blocks / transformer_blocks)
         if 'double_block' in key or 'transformer_block' in key:
-            # Context (text) path - should NOT have spatial mask, only token position masking
-            # Excludes: ff_context, add_q_proj, add_k_proj, add_v_proj, to_add_out, txt_attn, txt_mlp
+            # Context (text) path - no spatial mask, but token-position masking
+            # applies (parity with diffusers, which routes token_pos_maps to
+            # add_q/k/v_proj, to_add_out and ff_context). Sequence here is
+            # text-only.
             if 'ff_context' in key:
-                return False, None
+                return True, 'txt_only'
             if any(s in key for s in ['add_q', 'add_k', 'add_v', 'to_add_out']):
-                return False, None
-            # txt_attn and txt_mlp are for text path, should NOT have spatial mask
+                return True, 'txt_only'
             if 'txt_attn' in key or 'txt_mlp' in key:
-                return False, None
+                return True, 'txt_only'
             
             # Image path - should have spatial mask (img only, no text in sequence)
             # Includes: to_q, to_k, to_v, to_out, ff (but not ff_context)
@@ -553,6 +571,61 @@ class MultiAdapterBypassForwardHook:
         if self._mask_type_cached is None:
             self._should_apply_spatial_mask()  # Populate cache
         return self._mask_type_cached
+
+    def _get_other_token_positions(self, adapter_name: str) -> Optional[List[int]]:
+        """
+        Positions (text-segment indices) of OTHER adapters' concept tokens.
+
+        Each LoRA's delta is zeroed at these positions so it cannot rewrite
+        another character's concept-token representations (parity with the
+        diffusers reference FreeFuseLinear.forward). Uses batch-0 positions,
+        matching the attention-bias construction. Names starting with "_"
+        (e.g. __background__) are never treated as "other adapters".
+        """
+        if not self.token_pos_maps:
+            return None
+        if adapter_name in self._other_pos_cache:
+            return self._other_pos_cache[adapter_name]
+
+        positions: List[int] = []
+        for name, positions_list in self.token_pos_maps.items():
+            if name == adapter_name or (isinstance(name, str) and name.startswith("_")):
+                continue
+            if not isinstance(positions_list, list) or not positions_list:
+                continue
+            first = positions_list[0]
+            if isinstance(first, int):
+                # Flat list of ints
+                positions.extend(p for p in positions_list if isinstance(p, int))
+            elif isinstance(first, list):
+                positions.extend(p for p in first if isinstance(p, int))
+
+        result = sorted(set(positions)) if positions else None
+        self._other_pos_cache[adapter_name] = result
+        return result
+
+    def _zero_other_token_positions(
+        self,
+        full_mask: torch.Tensor,
+        adapter_name: str,
+        txt_start: int,
+        txt_len: int,
+    ):
+        """Zero full_mask at other adapters' token positions inside the text segment.
+
+        Positions are indices into the text segment; the segment occupies
+        full_mask[txt_start : txt_start + txt_len]. Out-of-range positions are
+        dropped (never clamped: clamping would collapse them onto one token).
+        """
+        if txt_len <= 0:
+            return
+        positions = self._get_other_token_positions(adapter_name)
+        if not positions:
+            return
+        idx = [txt_start + p for p in positions if 0 <= p < txt_len]
+        if not idx:
+            return
+        full_mask[torch.tensor(idx, device=full_mask.device, dtype=torch.long)] = 0
     
     def _get_mask_for_sequence(
         self,
@@ -591,7 +664,17 @@ class MultiAdapterBypassForwardHook:
         
         mask = self.masks[adapter_name]
         mask_type = self._get_mask_type()
-        
+
+        # Text-only layers (Flux double-stream context path): no spatial mask,
+        # but the LoRA must not rewrite other adapters' concept tokens. Without
+        # token positions there is nothing to do (previous behavior: unmasked).
+        if mask_type == 'txt_only':
+            if not self.token_pos_maps:
+                return None
+            full_mask = torch.ones(seq_len, device=device, dtype=dtype)
+            self._zero_other_token_positions(full_mask, adapter_name, 0, seq_len)
+            return full_mask
+
         # Determine img_len based on mask_type
         if mask_type == 'img_with_text':
             # Flux single stream: seq_len = txt_len + img_len
@@ -634,6 +717,9 @@ class MultiAdapterBypassForwardHook:
                         full_mask = torch.ones(seq_len, device=device, dtype=dtype)
                         full_mask[inferred_txt_len:inferred_txt_len + img_len] = mask_flat.to(
                             device=device, dtype=dtype
+                        )
+                        self._zero_other_token_positions(
+                            full_mask, adapter_name, 0, inferred_txt_len
                         )
                         return full_mask
             
@@ -683,11 +769,13 @@ class MultiAdapterBypassForwardHook:
             # (ComfyUI's NextDiT: padded_full_embed = torch.cat(feats + (x,), dim=1))
             full_mask = torch.ones(seq_len, device=device, dtype=dtype)
             full_mask[cap_len:cap_len + img_len] = mask_flat[:img_len].to(device=device, dtype=dtype)
+            self._zero_other_token_positions(full_mask, adapter_name, 0, cap_len)
         elif mask_type == 'img_with_text':
             # Flux single stream: txt tokens come first, then img tokens
             # Layout: [txt_tokens(1.0), img_tokens(spatial mask)]
             full_mask = torch.ones(seq_len, device=device, dtype=dtype)
             full_mask[self.txt_len:self.txt_len + img_len] = mask_flat.to(device=device, dtype=dtype)
+            self._zero_other_token_positions(full_mask, adapter_name, 0, self.txt_len)
         else:
             # img_only: mask covers entire sequence (which is only image tokens)
             full_mask = mask_flat.to(device=device, dtype=dtype)
@@ -965,6 +1053,7 @@ class OffsetBypassInjectionManager:
         self._pending_masks: Optional[Dict[str, torch.Tensor]] = None
         self._pending_latent_size: Optional[Tuple[int, int]] = None
         self._pending_txt_len: int = 256
+        self._pending_token_pos_maps: Optional[Dict[str, List[List[int]]]] = None
 
         # Track which model instance the current `hooks` list was built for.
         # ModelPatcher.clone() deepcopies model_options, which can leave hooks
@@ -1123,7 +1212,8 @@ class OffsetBypassInjectionManager:
                     hook.set_masks(
                         current_manager._pending_masks,
                         current_manager._pending_latent_size,
-                        current_manager._pending_txt_len
+                        current_manager._pending_txt_len,
+                        token_pos_maps=getattr(current_manager, "_pending_token_pos_maps", None),
                     )
         
         def eject_all(model_patcher):
@@ -1173,23 +1263,28 @@ class OffsetBypassInjectionManager:
         masks: Dict[str, torch.Tensor],
         latent_size: Tuple[int, int],
         txt_len: int = 256,
+        token_pos_maps: Optional[Dict[str, List[List[int]]]] = None,
     ):
         """
         Set FreeFuse masks on all hooks.
-        
+
         This method stores masks both as pending (for hooks not yet injected)
         and applies to any existing hooks immediately.
-        
+
         Args:
             masks: Dict mapping adapter_name -> spatial mask (H, W)
             latent_size: (H, W) of the latent space
             txt_len: Length of text tokens (for Flux: CLIP + T5)
+            token_pos_maps: Optional adapter_name -> token positions for
+                text-segment token masking (zero each LoRA at other adapters'
+                concept tokens)
         """
         # Store as pending for future inject() calls
         self._pending_masks = masks
         self._pending_latent_size = latent_size
         self._pending_txt_len = txt_len
-        
+        self._pending_token_pos_maps = token_pos_maps
+
         # Apply to existing hooks immediately (if already injected)
         hooks_updated = 0
         for hook in self.hooks:
@@ -1200,7 +1295,7 @@ class OffsetBypassInjectionManager:
                 and current_forward.__self__ is hook
             )
             if is_injected:
-                hook.set_masks(masks, latent_size, txt_len)
+                hook.set_masks(masks, latent_size, txt_len, token_pos_maps=token_pos_maps)
                 hooks_updated += 1
         
         if hooks_updated > 0:
@@ -1212,6 +1307,7 @@ class OffsetBypassInjectionManager:
         """Clear masks from all hooks."""
         self._pending_masks = None
         self._pending_latent_size = None
+        self._pending_token_pos_maps = None
         for hook in self.hooks:
             hook.clear_masks()
     
