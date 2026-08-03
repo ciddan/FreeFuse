@@ -99,6 +99,7 @@ class FreeFuseFluxBiasBlockReplace:
             positive_bias_scale=self.config.positive_bias_scale,
             bidirectional=self.config.bidirectional,
             use_positive_bias=self.config.use_positive_bias,
+            img_img_bias_scale=getattr(self.config, 'img_img_bias_scale', 0.0),
             device=device,
             dtype=dtype,
         )
@@ -336,6 +337,7 @@ class FreeFuseFluxBiasSingleBlockReplace:
                         positive_bias_scale=config.positive_bias_scale if config.use_positive_bias else 0.0,
                         bidirectional=config.bidirectional,
                         use_positive_bias=config.use_positive_bias,
+                        img_img_bias_scale=getattr(config, 'img_img_bias_scale', 0.0),
                         device=x.device,
                         dtype=x.dtype,
                     )
@@ -488,6 +490,7 @@ class FreeFuseSDXLBiasAttnReplace:
                 bias_scale=self.config.bias_scale,
                 positive_bias_scale=self.config.positive_bias_scale,
                 use_positive_bias=self.config.use_positive_bias,
+                img_img_bias_scale=getattr(self.config, 'img_img_bias_scale', 0.0),
                 device=device,
                 dtype=dtype,
             )
@@ -650,6 +653,7 @@ class FreeFuseZImageBiasBlockReplace:
             positive_bias_scale=self.config.positive_bias_scale,
             bidirectional=self.config.bidirectional,
             use_positive_bias=self.config.use_positive_bias,
+            img_img_bias_scale=getattr(self.config, 'img_img_bias_scale', 0.0),
             device=device,
             dtype=dtype,
         )
@@ -1068,6 +1072,7 @@ def _apply_z_image_bias_patches(
             positive_bias_scale=config.positive_bias_scale,
             bidirectional=config.bidirectional,
             use_positive_bias=config.use_positive_bias,
+            img_img_bias_scale=getattr(config, 'img_img_bias_scale', 0.0),
             apply_to_blocks=apply_to_blocks,
         )
     elif isinstance(apply_to_blocks, list):
@@ -1079,6 +1084,7 @@ def _apply_z_image_bias_patches(
                 positive_bias_scale=config.positive_bias_scale,
                 bidirectional=config.bidirectional,
                 use_positive_bias=config.use_positive_bias,
+                img_img_bias_scale=getattr(config, 'img_img_bias_scale', 0.0),
                 apply_to_blocks=apply_to_blocks,
             )
     

@@ -32,6 +32,7 @@ def construct_attention_bias(
     positive_bias_scale: float = 1.0,
     bidirectional: bool = True,
     use_positive_bias: bool = True,
+    img_img_bias_scale: float = 0.0,
     device: torch.device = None,
     dtype: torch.dtype = None,
 ) -> torch.Tensor:
@@ -54,6 +55,11 @@ def construct_attention_bias(
         bidirectional: If True, also apply bias for text->image direction. Default True.
         use_positive_bias: If True, add positive bias for same-LoRA attention pairs,
                           in addition to negative bias for cross-LoRA pairs. Default True.
+        img_img_bias_scale: If > 0, add NEGATIVE bias between image tokens of
+                          different LoRAs' regions (self/joint-attention isolation).
+                          Suppresses direct latent-to-latent identity migration
+                          between character regions. 0 (default) = off, previous
+                          behavior. Background/unowned tokens are unaffected.
         device: Device for the output tensor
         dtype: Data type for the output tensor
         
@@ -219,16 +225,20 @@ def construct_attention_bias(
 
         return flat
 
+    # Collect normalized per-LoRA image masks for the img<->img isolation term
+    normalized_img_masks: Dict[str, torch.Tensor] = {}
+
     # For each LoRA, get its image mask and text token positions
     for lora_name, img_mask in lora_masks.items():
         if lora_name not in lora_name_to_idx:
             continue
         lora_idx = lora_name_to_idx[lora_name]
-        
+
         # Normalize mask to (B, img_seq_len), resizing if needed
         if img_mask.dim() == 1:
             img_mask = img_mask.unsqueeze(0).expand(batch_size, -1)
         img_mask = _normalize_img_mask(img_mask, img_seq_len)
+        normalized_img_masks[lora_name] = img_mask
         
         # === NEGATIVE BIAS: Cross-LoRA suppression ===
         # For image positions in this LoRA's region,
@@ -282,9 +292,25 @@ def construct_attention_bias(
             if use_positive_bias:
                 txt_to_img_positive_bias = this_lora_text_mask.unsqueeze(0).unsqueeze(-1) * img_mask.unsqueeze(1)
                 txt_to_img_positive_bias = txt_to_img_positive_bias * positive_bias_scale
-                
+
                 attention_bias[:, :txt_seq_len, txt_seq_len:] += txt_to_img_positive_bias
-    
+
+    # === IMG<->IMG ISOLATION: cross-region self/joint-attention suppression ===
+    # Queries in LoRA A's region are suppressed from attending keys in any other
+    # LoRA's region (and vice versa, by symmetry of the loop). Background /
+    # unowned tokens carry no bias in either direction, so scene context and
+    # contact-boundary blending with the background stay untouched.
+    if img_img_bias_scale > 0 and len(normalized_img_masks) >= 2:
+        for lora_name, img_mask in normalized_img_masks.items():
+            others = torch.zeros_like(img_mask)
+            for other_name, other_mask in normalized_img_masks.items():
+                if other_name != lora_name:
+                    others = others + other_mask
+            others = others.clamp(max=1.0)
+            # (B, img, 1) * (B, 1, img) -> (B, img, img)
+            img_img_bias = img_mask.unsqueeze(-1) * others.unsqueeze(1)
+            attention_bias[:, txt_seq_len:, txt_seq_len:] += img_img_bias * (-img_img_bias_scale)
+
     logging.debug(f"[FreeFuse] Constructed attention bias: shape={attention_bias.shape}, "
                 f"bias_scale={bias_scale}, positive_scale={positive_bias_scale}, "
                 f"bidirectional={bidirectional}, positive_bias={use_positive_bias}")
@@ -301,11 +327,16 @@ def construct_attention_bias_sdxl(
     bias_scale: float = 5.0,
     positive_bias_scale: float = 1.0,
     use_positive_bias: bool = True,
+    img_img_bias_scale: float = 0.0,
     device: torch.device = None,
     dtype: torch.dtype = None,
 ) -> torch.Tensor:
     """
     Construct attention bias for SDXL cross-attention.
+
+    Note: img_img_bias_scale is accepted for interface parity but unused —
+    SDXL's per-layer cross-attention bias has no image-image quadrant
+    (self-attention isolation would need a separate attn1 patch).
     
     SDXL uses separate cross-attention (Q from image, K/V from text), so the bias
     structure is simpler: (B, img_seq_len, txt_seq_len) for each cross-attention layer.
@@ -411,6 +442,7 @@ class AttentionBiasConfig:
         bidirectional: bool = True,
         use_positive_bias: bool = True,
         apply_to_blocks: Optional[List[str]] = None,
+        img_img_bias_scale: float = 0.0,
     ):
         """
         Args:
@@ -432,6 +464,7 @@ class AttentionBiasConfig:
         self.bidirectional = bidirectional
         self.use_positive_bias = use_positive_bias
         self.apply_to_blocks = apply_to_blocks
+        self.img_img_bias_scale = img_img_bias_scale
         
     def should_apply_to_block(self, block_name: str) -> bool:
         """Check if bias should be applied to a specific block."""
@@ -474,6 +507,7 @@ class AttentionBiasConfig:
             "bidirectional": self.bidirectional,
             "use_positive_bias": self.use_positive_bias,
             "apply_to_blocks": self.apply_to_blocks,
+            "img_img_bias_scale": self.img_img_bias_scale,
         }
     
     @classmethod
