@@ -29,8 +29,17 @@ than to wrong math. The cases that fall through are counted and logged
 once each, because a silently unbiased run is exactly the failure this
 codebase has been bitten by before.
 
+This is the default bias route where it is usable. The per-family paths
+remain as a capability ladder, each covering a distinct gap:
+
+    override  needs comfy's wrap_attn + flex_attention   (default)
+    flex      needs flex_attention only  (krea2_flex_bias, mirrors the
+              attention block — version-fragile, hence the fallback)
+    dense     needs neither  (krea2_support / zimage_support, rebuilds a
+              dense (S, S) bias per call)
+
 Escape hatches:
-  FREEFUSE_ATTN_OVERRIDE=1   opt in (default off while it is validated)
+  FREEFUSE_ATTN_OVERRIDE=0   opt out, use the per-family paths
   FREEFUSE_OVERRIDE_VALIDATE=1  on the first biased call, also compute
                              the dense-bias SDPA result and log max|diff|
 """
@@ -50,6 +59,45 @@ from .flex_bias_core import (
 )
 
 VALIDATE_MAX_SEQ = 9000  # above this the dense reference is itself an OOM
+
+_MECHANISM_OK: Optional[bool] = None
+
+
+def override_mechanism_supported() -> bool:
+    """Prove comfy actually honours the override before relying on it.
+
+    Installing the host on a comfy without `wrap_attn` would register a
+    callable nothing ever invokes — i.e. a render with NO bias at all,
+    silently. That is precisely how the Z-Image `patches_replace` route
+    was dead for its entire life, so it is checked rather than assumed:
+    one tiny CPU attention call with a sentinel override, once per
+    process.
+    """
+    global _MECHANISM_OK
+    if _MECHANISM_OK is not None:
+        return _MECHANISM_OK
+    try:
+        from comfy.ldm.modules.attention import optimized_attention_masked
+        fired = []
+
+        def _sentinel(func, *args, **kwargs):
+            fired.append(True)
+            return func(*args, **kwargs)
+
+        probe = torch.zeros(1, 1, 4, 8)
+        optimized_attention_masked(
+            probe, probe, probe, 1, None, skip_reshape=True,
+            transformer_options={"optimized_attention_override": _sentinel})
+        _MECHANISM_OK = bool(fired)
+    except Exception as e:
+        logging.warning(f"[FreeFuse attn-override] capability probe failed: {e}")
+        _MECHANISM_OK = False
+    if not _MECHANISM_OK:
+        logging.info(
+            "[FreeFuse attn-override] this ComfyUI does not honour "
+            "transformer_options['optimized_attention_override'] — falling "
+            "back to the per-family bias paths")
+    return _MECHANISM_OK
 
 
 def _lengths_from_img_slice(transformer_options, seqlen) -> Optional[Tuple[int, int, int]]:
@@ -262,10 +310,12 @@ def apply_freefuse_attention_override(
 ) -> Optional[FreeFuseAttentionOverride]:
     """Install the bias host on this model clone. Returns the host, or
     None when the override route is unavailable (caller falls back)."""
-    if os.environ.get("FREEFUSE_ATTN_OVERRIDE") != "1":
-        return None
+    if os.environ.get("FREEFUSE_ATTN_OVERRIDE", "1") == "0":
+        return None  # explicit opt-out
     if not FLEX_AVAILABLE:
         logging.info("[FreeFuse attn-override] flex_attention unavailable")
+        return None
+    if not override_mechanism_supported():
         return None
 
     live = len([n for n in lora_masks if not n.startswith("_")])
