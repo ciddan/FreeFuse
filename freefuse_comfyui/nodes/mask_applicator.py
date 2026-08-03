@@ -271,29 +271,37 @@ When enabled, constructs soft attention bias to guide cross-attention:
             
             # Apply attention bias patches with dynamic bias construction
             # Bias will be built at runtime based on actual txt/img sequence lengths
-            apply_attention_bias_patches(
-                model_patcher=model_patcher,
-                attention_bias=None,  # Not used - bias built dynamically
-                config=config,
-                txt_seq_len=txt_seq_len,  # Estimate - actual determined at runtime
-                model_type="flux",
+            # Prefer comfy's attention override: the per-block dense caches
+            # below are the reason Flux 2 OOMs in a confined continuation
+            # (Klein 9B keeps one (S,S) tensor per patched block — ~15.6 GB
+            # across 32 blocks at 4 MP). The override is O(S).
+            from ..freefuse_core.attention_override import \
+                apply_flux_attention_override
+            flux_host = apply_flux_attention_override(
+                model_patcher,
                 lora_masks=lora_masks_flat,
                 token_pos_maps=token_pos_maps,
+                config=config,
+                latent_size=latent_size,
             )
+            if flux_host is None:
+                apply_attention_bias_patches(
+                    model_patcher=model_patcher,
+                    attention_bias=None,  # Not used - bias built dynamically
+                    config=config,
+                    txt_seq_len=txt_seq_len,  # Estimate - actual at runtime
+                    model_type="flux",
+                    lora_masks=lora_masks_flat,
+                    token_pos_maps=token_pos_maps,
+                )
             print(f"[FreeFuse] Applied attention bias for {model_type} "
-                  f"(bias_scale={bias_scale}, positive_scale={positive_bias_scale}, "
+                  f"({'attn-override' if flux_host is not None else 'dense'} path, "
+                  f"bias_scale={bias_scale}, positive_scale={positive_bias_scale}, "
                   f"bidirectional={bidirectional}, blocks={bias_blocks})")
         
         elif model_type == "z_image":
             # Z-Image uses unified [img, txt] sequence (image FIRST)
             img_seq_len = latent_h * latent_w
-            
-            # Estimate cap_seq_len from token_pos_maps
-            cap_seq_len = 256  # Default for Qwen3 tokenizer
-            for positions_list in token_pos_maps.values():
-                if positions_list and positions_list[0]:
-                    max_pos = max(positions_list[0])
-                    cap_seq_len = max(cap_seq_len, max_pos + 10)
             
             # Flatten masks to (B, img_seq_len)
             lora_masks_flat = {}
@@ -305,18 +313,47 @@ When enabled, constructs soft attention bias to guide cross-attention:
                 mask_flat = mask.reshape(-1)
                 lora_masks_flat[name] = mask_flat.unsqueeze(0)  # Add batch dim
             
-            apply_attention_bias_patches(
-                model_patcher=model_patcher,
-                attention_bias=None,
-                config=config,
-                txt_seq_len=cap_seq_len,
-                model_type="z_image",
+            # comfy's Lumina2 forward consults no patches_replace, so the
+            # set_model_patch_replace route below registers patches nothing
+            # ever reads - bias-on and bias-off renders come out
+            # bit-identical. Use the attention override, or per-call forward
+            # hooks where the override is unavailable.
+            from ..freefuse_core.attention_override import \
+                apply_zimage_attention_override
+            from ..freefuse_core.zimage_support import (
+                apply_zimage_bias_patches,
+                resolve_zimage_bias_layers,
+            )
+
+            zimage_pad_mult = getattr(
+                self._get_diffusion_model(model_patcher),
+                "pad_tokens_multiple", None)
+            zimage_layers = resolve_zimage_bias_layers(
+                self._get_diffusion_model(model_patcher), bias_blocks)
+
+            zimage_host = apply_zimage_attention_override(
+                model_patcher,
                 lora_masks=lora_masks_flat,
                 token_pos_maps=token_pos_maps,
+                config=config,
+                layer_indices=zimage_layers,
+                latent_size=latent_size,
+                pad_tokens_multiple=zimage_pad_mult,
             )
+            if zimage_host is None:
+                apply_zimage_bias_patches(
+                    model_patcher,
+                    lora_masks=lora_masks_flat,
+                    token_pos_maps=token_pos_maps,
+                    config=config,
+                    layer_indices=zimage_layers,
+                    pad_tokens_multiple=zimage_pad_mult,
+                )
             print(f"[FreeFuse] Applied attention bias for Z-Image "
-                  f"(bias_scale={bias_scale}, positive_scale={positive_bias_scale}, "
-                  f"bidirectional={bidirectional}, img_seq={img_seq_len}, cap_seq={cap_seq_len})")
+                  f"({'attn-override' if zimage_host is not None else 'per-call hooks'}, "
+                  f"bias_scale={bias_scale}, positive_scale={positive_bias_scale}, "
+                  f"bidirectional={bidirectional}, img_seq={img_seq_len}, "
+                  f"layers={len(zimage_layers)})")
 
         elif model_type == "krea2":
             # Krea2 is single-stream, [txt, img] sequence (text FIRST, same as Z-Image's
@@ -338,16 +375,32 @@ When enabled, constructs soft attention bias to guide cross-attention:
 
             krea2_block_indices = self._resolve_krea2_bias_blocks(model_patcher, bias_blocks)
 
-            apply_krea2_bias_patches(
+            # Prefer comfy's optimized_attention_override (family-agnostic,
+            # never reimplements the model's attention block); fall back to
+            # the dense (S,S) mask path.
+            from ..freefuse_core.attention_override import \
+                apply_freefuse_attention_override
+
+            override_host = apply_freefuse_attention_override(
                 model_patcher,
                 lora_masks=lora_masks_flat,
                 token_pos_maps=token_pos_maps,
                 config=config,
                 block_indices=krea2_block_indices,
+                latent_size=latent_size,
             )
+            if override_host is None:
+                apply_krea2_bias_patches(
+                    model_patcher,
+                    lora_masks=lora_masks_flat,
+                    token_pos_maps=token_pos_maps,
+                    config=config,
+                    block_indices=krea2_block_indices,
+                )
             print(f"[FreeFuse] Applied attention bias for Krea2 "
-                  f"(bias_scale={bias_scale}, positive_scale={positive_bias_scale}, "
-                  f"blocks={bias_blocks} -> {krea2_block_indices})")
+                  f"({'attn-override' if override_host is not None else 'dense'} path, "
+                  f"bias_scale={bias_scale}, positive_scale={positive_bias_scale}, "
+                  f"blocks={bias_blocks} -> {krea2_block_indices[0]}..{krea2_block_indices[-1]})")
 
         else:  # SDXL
             # For SDXL, use the direct SDXL bias patches
@@ -446,6 +499,13 @@ When enabled, constructs soft attention bias to guide cross-attention:
         # In practice, the actual length depends on the prompt
         freefuse_data = transformer_options.get("freefuse_data", {})
         txt_len = freefuse_data.get("txt_len", 512)  # Default for Flux CLIP+T5
+
+        # NextDiT/Z-Image pads the caption and image token runs up to this
+        # multiple. The hooks need it to place spatial masks correctly;
+        # None for families that do not pad.
+        pad_tokens_multiple = getattr(
+            getattr(model_patcher.model, "diffusion_model", None),
+            "pad_tokens_multiple", None)
         
         # Look for multiple bypass managers (one per LoRA)
         managers_list = transformer_options.get("freefuse_bypass_managers", [])
@@ -455,7 +515,9 @@ When enabled, constructs soft attention bias to guide cross-attention:
             for manager_info in managers_list:
                 manager = manager_info.get("manager")
                 if manager is not None and isinstance(manager, OffsetBypassInjectionManager):
-                    manager.set_masks(masks, latent_size, txt_len, token_pos_maps=token_pos_maps)
+                    manager.set_masks(masks, latent_size, txt_len,
+                                      token_pos_maps=token_pos_maps,
+                                      pad_tokens_multiple=pad_tokens_multiple)
                     hooks_updated += manager.get_hook_count()
 
             if hooks_updated > 0:
@@ -466,13 +528,16 @@ When enabled, constructs soft attention bias to guide cross-attention:
         # Fallback: Single manager
         manager = transformer_options.get("freefuse_bypass_manager")
         if manager is not None and isinstance(manager, OffsetBypassInjectionManager):
-            manager.set_masks(masks, latent_size, txt_len, token_pos_maps=token_pos_maps)
+            manager.set_masks(masks, latent_size, txt_len,
+                              token_pos_maps=token_pos_maps,
+                              pad_tokens_multiple=pad_tokens_multiple)
             logging.info(f"[FreeFuse] Applied masks via single bypass manager ({manager.get_hook_count()} hooks), txt_len={txt_len}, "
                          f"token_masking={'on' if token_pos_maps else 'off'}")
             return
         
         # Fallback: Look for hooks in model traversal
-        hooks_found = self._find_hooks_in_model(model_patcher, masks, latent_size, txt_len, token_pos_maps)
+        hooks_found = self._find_hooks_in_model(model_patcher, masks, latent_size, txt_len, token_pos_maps,
+                                                pad_tokens_multiple=pad_tokens_multiple)
         if hooks_found > 0:
             logging.info(f"[FreeFuse] Applied masks to {hooks_found} hooks via model traversal")
             return
@@ -488,6 +553,7 @@ When enabled, constructs soft attention bias to guide cross-attention:
         latent_size: Tuple[int, int],
         txt_len: int = 512,
         token_pos_maps: Optional[Dict] = None,
+        pad_tokens_multiple: Optional[int] = None,
     ) -> int:
         """Find MultiAdapterBypassForwardHook instances in the model and set masks."""
         hooks_found = 0
@@ -506,7 +572,9 @@ When enabled, constructs soft attention bias to guide cross-attention:
                 if hasattr(forward, '__self__'):
                     hook_self = forward.__self__
                     if isinstance(hook_self, MultiAdapterBypassForwardHook):
-                        hook_self.set_masks(masks, latent_size, txt_len, token_pos_maps=token_pos_maps)
+                        hook_self.set_masks(masks, latent_size, txt_len,
+                                            token_pos_maps=token_pos_maps,
+                                            pad_tokens_multiple=pad_tokens_multiple)
                         hooks_found += 1
 
         return hooks_found
