@@ -341,12 +341,18 @@ When enabled, constructs soft attention bias to guide cross-attention:
 
             krea2_block_indices = self._resolve_krea2_bias_blocks(model_patcher, bias_blocks)
 
-            # FlexAttention path: bias computed in-kernel from O(S) vectors —
-            # no dense (S,S) matrix, no per-head expansion transient. Falls
-            # back to the legacy dense-mask path when flex is unavailable or
-            # FREEFUSE_KREA2_DENSE=1.
+            # Preference order, most general first:
+            #  1. comfy's optimized_attention_override — family-agnostic,
+            #     never reimplements the model's attention block
+            #     (FREEFUSE_ATTN_OVERRIDE=1 while it is under validation)
+            #  2. the Krea2 flex forward replacement — O(S), but a mirror
+            #     of comfy's block and so version-fragile
+            #  3. the legacy dense (S,S) mask path
+            from ..freefuse_core.attention_override import \
+                apply_freefuse_attention_override
             from ..freefuse_core.krea2_flex_bias import apply_krea2_flex_bias_patches
-            used_flex = apply_krea2_flex_bias_patches(
+
+            override_host = apply_freefuse_attention_override(
                 model_patcher,
                 lora_masks=lora_masks_flat,
                 token_pos_maps=token_pos_maps,
@@ -354,16 +360,28 @@ When enabled, constructs soft attention bias to guide cross-attention:
                 block_indices=krea2_block_indices,
                 latent_size=latent_size,
             )
-            if not used_flex:
-                apply_krea2_bias_patches(
+            used_flex = False
+            if override_host is None:
+                used_flex = apply_krea2_flex_bias_patches(
                     model_patcher,
                     lora_masks=lora_masks_flat,
                     token_pos_maps=token_pos_maps,
                     config=config,
                     block_indices=krea2_block_indices,
+                    latent_size=latent_size,
                 )
+                if not used_flex:
+                    apply_krea2_bias_patches(
+                        model_patcher,
+                        lora_masks=lora_masks_flat,
+                        token_pos_maps=token_pos_maps,
+                        config=config,
+                        block_indices=krea2_block_indices,
+                    )
+            path = ("attn-override" if override_host is not None
+                    else "flex" if used_flex else "dense")
             print(f"[FreeFuse] Applied attention bias for Krea2 "
-                  f"({'flex' if used_flex else 'dense'} path, "
+                  f"({path} path, "
                   f"bias_scale={bias_scale}, positive_scale={positive_bias_scale}, "
                   f"blocks={bias_blocks} -> {krea2_block_indices[0]}..{krea2_block_indices[-1]})")
 
