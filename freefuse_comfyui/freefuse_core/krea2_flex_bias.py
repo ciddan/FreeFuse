@@ -49,31 +49,31 @@ except Exception:
     flex_attention = None
     _FLEX_AVAILABLE = False
 
-# Every (cap_len, img_len) shape is a fresh compile under dynamic=False;
-# a session mixing resolutions and prompt lengths accumulates variants.
-# Dynamo's default recompile limit (8) then makes it silently fall back
-# to EAGER flex, whose math path materializes the full (B, H, S, S)
-# score matrix in fp32 — a multi-GB bomb, strictly worse than the dense
-# path this module replaces. Raise the limit far above any real session
-# and, where the knob exists, make limit-hits raise instead of falling
-# back (loud failure over silent catastrophe).
-try:
-    import torch._dynamo as _dynamo
-    # torch >= 2.10 renamed the operative knob to recompile_limit;
-    # cache_size_limit still exists but is no longer consulted (verified
-    # against the convert_frame warning). Set every spelling.
-    for _name, _val in (("recompile_limit", 64),
-                        ("accumulated_recompile_limit", 512),
-                        ("cache_size_limit", 64),
-                        ("accumulated_cache_size_limit", 512)):
-        if hasattr(_dynamo.config, _name):
-            setattr(_dynamo.config, _name,
-                    max(getattr(_dynamo.config, _name) or 0, _val))
-    if hasattr(_dynamo.config, "fail_on_recompile_limit_hit"):
-        _dynamo.config.fail_on_recompile_limit_hit = True
-except Exception as e:
-    logging.warning(f"[FreeFuse Krea2 flex] could not raise dynamo "
-                    f"recompile limit: {e}")
+def _ensure_dynamo_limits():
+    """Re-assert dynamo limits. Process-global config is a commons:
+    other custom nodes (e.g. SeedVR2's TorchCompileSettings) legitimately
+    set their own values and clobber ours between runs, after which the
+    next new flex shape silently falls back to the eager S^2 fp32 math
+    path. Called at import AND before every potential (re)compile."""
+    try:
+        import torch._dynamo as _dynamo
+        # torch >= 2.10 renamed the operative knob to recompile_limit;
+        # cache_size_limit still exists but is no longer consulted.
+        for _name, _val in (("recompile_limit", 64),
+                            ("accumulated_recompile_limit", 512),
+                            ("cache_size_limit", 64),
+                            ("accumulated_cache_size_limit", 512)):
+            if hasattr(_dynamo.config, _name):
+                setattr(_dynamo.config, _name,
+                        max(getattr(_dynamo.config, _name) or 0, _val))
+        if hasattr(_dynamo.config, "fail_on_recompile_limit_hit"):
+            _dynamo.config.fail_on_recompile_limit_hit = True
+    except Exception as e:
+        logging.warning(f"[FreeFuse Krea2 flex] could not raise dynamo "
+                        f"recompile limit: {e}")
+
+
+_ensure_dynamo_limits()
 
 _flex_compiled = None
 
@@ -218,6 +218,7 @@ class _FlexBiasState:
                 f"cap_len={cap_len}")
         key = (cap_len, img_len)
         if self._key != key or self.score_mod is None:
+            _ensure_dynamo_limits()  # re-assert: other nodes clobber these
             masks = {
                 name: _resize_flat_mask(mask.reshape(-1).float(),
                                         self.latent_size, img_len)
