@@ -352,6 +352,7 @@ When enabled, constructs soft attention bias to guide cross-attention:
                 token_pos_maps=token_pos_maps,
                 config=config,
                 block_indices=krea2_block_indices,
+                latent_size=latent_size,
             )
             if not used_flex:
                 apply_krea2_bias_patches(

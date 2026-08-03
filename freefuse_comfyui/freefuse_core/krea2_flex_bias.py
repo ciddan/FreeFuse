@@ -135,38 +135,76 @@ def make_score_mod(vectors: Dict[str, torch.Tensor], config) -> Callable:
     return score_mod
 
 
+def _resize_flat_mask(flat: torch.Tensor, src_hw: Optional[Tuple[int, int]],
+                      target_len: int) -> torch.Tensor:
+    """Area-resize a flat token mask to a new token count (grid aspect
+    preserved). Mirrors the dense path's per-forward mask resize so the
+    same patched model reuses correctly at a different resolution
+    (e.g. a confined high-res pass after upscale)."""
+    n = flat.numel()
+    if n == target_len:
+        return flat
+    if src_hw is not None and src_hw[0] * src_hw[1] == n:
+        h, w = int(src_hw[0]), int(src_hw[1])
+    else:
+        # infer a plausible grid for the source
+        h = int(n ** 0.5)
+        while h > 1 and n % h:
+            h -= 1
+        w = n // h
+    ratio = w / h
+    th = max(1, int(round((target_len / ratio) ** 0.5)))
+    tw = target_len // th
+    while th > 1 and th * tw != target_len:
+        th -= 1
+        tw = target_len // th
+    if th * tw != target_len:
+        th, tw = 1, target_len
+    m2 = flat.view(1, 1, h, w).float()
+    return F.interpolate(m2, size=(th, tw), mode="area").reshape(-1)
+
+
 class _FlexBiasState:
     """Per-model-clone persistent state: vectors + score_mod + cap_len."""
 
-    def __init__(self, lora_masks, token_pos_maps, config):
+    def __init__(self, lora_masks, token_pos_maps, config,
+                 latent_size: Optional[Tuple[int, int]] = None):
         self.lora_masks = lora_masks
         self.token_pos_maps = token_pos_maps
         self.config = config
-        self.cap_len: Optional[int] = None
+        self.latent_size = latent_size  # mask grid (H, W) at build time
+        self.cap_len: Optional[int] = None  # captured from txtfusion per call
         self._key: Optional[Tuple[int, int]] = None
         self.score_mod: Optional[Callable] = None
         self.vectors = None
-        first = next(iter(n for n in lora_masks if not n.startswith("_")))
-        self.img_len = int(lora_masks[first].reshape(-1).numel())
         self._validated = False
 
     def ensure(self, seqlen: int, device: torch.device):
-        cap_len = seqlen - self.img_len
-        if cap_len <= 0:
+        if self.cap_len is None:
+            raise RuntimeError(
+                "[FreeFuse Krea2 flex] cap_len was not captured before "
+                "bias injection (txtfusion hook missing?)")
+        cap_len = int(self.cap_len)
+        img_len = seqlen - cap_len
+        if img_len <= 0:
             raise RuntimeError(
                 f"[FreeFuse Krea2 flex] invalid lengths: total={seqlen}, "
-                f"img_len={self.img_len}")
-        key = (cap_len, self.img_len)
+                f"cap_len={cap_len}")
+        key = (cap_len, img_len)
         if self._key != key or self.score_mod is None:
+            masks = {
+                name: _resize_flat_mask(mask.reshape(-1).float(),
+                                        self.latent_size, img_len)
+                for name, mask in self.lora_masks.items()
+                if not name.startswith("_")
+            }
             self.vectors = build_bias_vectors(
-                self.lora_masks, self.token_pos_maps, cap_len,
-                self.img_len, device)
+                masks, self.token_pos_maps, cap_len, img_len, device)
             self.score_mod = make_score_mod(self.vectors, self.config)
             self._key = key
             logging.info(
                 f"[FreeFuse Krea2 flex] bias vectors built: cap={cap_len} "
-                f"img={self.img_len} (O(S) memory; kernel compiles on "
-                "first step)")
+                f"img={img_len} (O(S) memory; kernel compiles per shape)")
         return self.score_mod
 
 
@@ -185,6 +223,19 @@ class FreeFuseKrea2FlexBias:
         if blocks is None:
             raise RuntimeError(
                 "[FreeFuse Krea2 flex] diffusion model has no `blocks`")
+        txtfusion = getattr(self.diffusion_model, "txtfusion", None)
+        if txtfusion is None:
+            raise RuntimeError(
+                "[FreeFuse Krea2 flex] cannot find `txtfusion` for cap_len "
+                "capture")
+        state = self.state
+
+        def _cap_hook(module, args, kwargs, output):
+            if torch.is_tensor(output):
+                state.cap_len = int(output.shape[1])
+
+        self._cap_handle = txtfusion.register_forward_hook(
+            _cap_hook, with_kwargs=True)
         installed = 0
         for idx in self.block_indices:
             if idx < 0 or idx >= len(blocks):
@@ -206,6 +257,9 @@ class FreeFuseKrea2FlexBias:
         for attn, orig in self._originals:
             attn.forward = orig
         self._originals.clear()
+        if getattr(self, "_cap_handle", None) is not None:
+            self._cap_handle.remove()
+            self._cap_handle = None
 
     def _make_forward(self, attn) -> Callable:
         # Mirrors comfy.ldm.krea2.model.Attention.forward, swapping
@@ -244,27 +298,38 @@ class FreeFuseKrea2FlexBias:
             if os.environ.get("FREEFUSE_FLEX_VALIDATE") == "1" \
                     and not state._validated:
                 state._validated = True
-                with torch.no_grad():
-                    S = seqlen
-                    cap = S - state.img_len
-                    from .attention_bias import construct_attention_bias
-                    dense = construct_attention_bias(
-                        lora_masks=state.lora_masks,
-                        token_pos_maps=state.token_pos_maps,
-                        txt_seq_len=cap, img_seq_len=state.img_len,
-                        bias_scale=state.config.bias_scale,
-                        positive_bias_scale=state.config.positive_bias_scale,
-                        bidirectional=state.config.bidirectional,
-                        use_positive_bias=state.config.use_positive_bias,
-                        img_img_bias_scale=getattr(
-                            state.config, "img_img_bias_scale", 0.0),
-                        device=q.device, dtype=torch.float32)
-                    ref = F.scaled_dot_product_attention(
-                        q.float(), k.float(), v.float(),
-                        attn_mask=dense.unsqueeze(1))
-                    diff = (out.float() - ref).abs().max().item()
-                    print(f"[FreeFuse Krea2 flex] VALIDATE max|flex-dense| "
-                          f"= {diff:.3e}")
+                if seqlen > 9000:
+                    print("[FreeFuse Krea2 flex] VALIDATE skipped: fp32 "
+                          f"dense reference at S={seqlen} would transiently "
+                          "allocate multiple GB")
+                else:
+                    with torch.no_grad():
+                        cap = int(state.cap_len)
+                        img_len = seqlen - cap
+                        from .attention_bias import construct_attention_bias
+                        masks = {
+                            n: _resize_flat_mask(
+                                mk.reshape(-1).float(), state.latent_size,
+                                img_len).unsqueeze(0)
+                            for n, mk in state.lora_masks.items()
+                            if not n.startswith("_")}
+                        dense = construct_attention_bias(
+                            lora_masks=masks,
+                            token_pos_maps=state.token_pos_maps,
+                            txt_seq_len=cap, img_seq_len=img_len,
+                            bias_scale=state.config.bias_scale,
+                            positive_bias_scale=state.config.positive_bias_scale,
+                            bidirectional=state.config.bidirectional,
+                            use_positive_bias=state.config.use_positive_bias,
+                            img_img_bias_scale=getattr(
+                                state.config, "img_img_bias_scale", 0.0),
+                            device=q.device, dtype=torch.float32)
+                        ref = F.scaled_dot_product_attention(
+                            q.float(), k.float(), v.float(),
+                            attn_mask=dense.unsqueeze(1))
+                        diff = (out.float() - ref).abs().max().item()
+                        print(f"[FreeFuse Krea2 flex] VALIDATE "
+                              f"max|flex-dense| = {diff:.3e}")
 
             out = out.transpose(1, 2).reshape(bsz, seqlen, -1)
             return attn.wo(out * F.sigmoid(gate))
@@ -278,6 +343,7 @@ def apply_krea2_flex_bias_patches(
     token_pos_maps: Dict[str, List[List[int]]],
     config,
     block_indices: Optional[List[int]] = None,
+    latent_size: Optional[Tuple[int, int]] = None,
 ) -> bool:
     """Register the per-call flex wrapper. Returns False if flex is
     unavailable (caller should fall back to the dense path)."""
@@ -291,7 +357,8 @@ def apply_krea2_flex_bias_patches(
     if block_indices is None:
         block_indices = list(range(len(blocks)))
 
-    state = _FlexBiasState(lora_masks, token_pos_maps, config)
+    state = _FlexBiasState(lora_masks, token_pos_maps, config,
+                           latent_size=latent_size)
     previous_wrapper = model.model_options.get("model_function_wrapper")
 
     def krea2_flex_wrapper(apply_model_fn, args):
