@@ -1,0 +1,480 @@
+"""
+FreeFuse attention bias hosted in comfy's own extension point.
+
+Every attention function in comfy/ldm/modules/attention.py is wrapped by
+`wrap_attn`, which delegates the whole call to
+`transformer_options["optimized_attention_override"](func, *args, **kwargs)`
+when one is installed (comfy >= the 2025-09-12 "Enable Runtime Selection
+of Attention Functions" change). The override receives q/k/v *already
+post-rope and post-GQA*, plus the live transformer_options.
+
+That is everything the bias needs, and nothing about a particular
+model's attention block — so one host serves every family instead of a
+per-family attention forward replacement. That matters beyond tidiness:
+a forward replacement is a *copy* of comfy's attention block and
+silently diverges when comfy edits theirs (Lumina's block was rewritten
+to use a fused rms-rope kernel on 2026-07-22).
+
+Sequence layout is the usual joint [txt(cap), img]. Lengths come from
+whatever the family publishes:
+
+  * Krea 2 sets transformer_options["img_slice"] = [txtlen, total]
+  * families that publish nothing need an explicit cap_len source
+    (see `cap_len_provider`) — Lumina/Z-Image publishes none
+
+Everything that cannot be handled falls through to the original
+attention function, so a miss degrades to "no bias on that call" rather
+than to wrong math. The cases that fall through are counted and logged
+once each, because a silently unbiased run is exactly the failure this
+codebase has been bitten by before.
+
+This is the default bias route where it is usable. The per-family paths
+remain as a capability ladder, each covering a distinct gap:
+
+    override  needs comfy's wrap_attn + flex_attention   (default)
+    dense     needs neither — the existing per-family bias patches,
+              which rebuild a dense (S, S) matrix
+
+Escape hatches:
+  FREEFUSE_ATTN_OVERRIDE=0   opt out, use the per-family paths
+  FREEFUSE_OVERRIDE_VALIDATE=1  on the first biased call, also compute
+                             the dense-bias SDPA result and log max|diff|
+"""
+
+import logging
+import os
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+import torch
+import torch.nn.functional as F
+
+from .flex_bias_core import (
+    FLEX_AVAILABLE,
+    BiasVectorCache,
+    MAX_ADAPTERS,
+    get_compiled_flex,
+)
+
+VALIDATE_MAX_SEQ = 9000  # above this the dense reference is itself an OOM
+
+_MECHANISM_OK: Optional[bool] = None
+
+
+def override_mechanism_supported() -> bool:
+    """Prove comfy actually honours the override before relying on it.
+
+    Installing the host on a comfy without `wrap_attn` would register a
+    callable nothing ever invokes — i.e. a render with NO bias at all,
+    silently. That is precisely how the Z-Image `patches_replace` route
+    was dead for its entire life, so it is checked rather than assumed:
+    one tiny CPU attention call with a sentinel override, once per
+    process.
+    """
+    global _MECHANISM_OK
+    if _MECHANISM_OK is not None:
+        return _MECHANISM_OK
+    try:
+        from comfy.ldm.modules.attention import optimized_attention_masked
+        fired = []
+
+        def _sentinel(func, *args, **kwargs):
+            fired.append(True)
+            return func(*args, **kwargs)
+
+        probe = torch.zeros(1, 1, 4, 8)
+        optimized_attention_masked(
+            probe, probe, probe, 1, None, skip_reshape=True,
+            transformer_options={"optimized_attention_override": _sentinel})
+        _MECHANISM_OK = bool(fired)
+    except Exception as e:
+        logging.warning(f"[FreeFuse attn-override] capability probe failed: {e}")
+        _MECHANISM_OK = False
+    if not _MECHANISM_OK:
+        logging.info(
+            "[FreeFuse attn-override] this ComfyUI does not honour "
+            "transformer_options['optimized_attention_override'] — falling "
+            "back to the per-family bias paths")
+    return _MECHANISM_OK
+
+
+def _lengths_from_img_slice(transformer_options, seqlen) -> Optional[Tuple[int, int, int]]:
+    """Krea 2 publishes [txtlen, total] — cap_len and img_len for free.
+
+    Returns (cap_len, img_len, real_img_len); Krea 2 does not pad its
+    image run, so the last two are the same.
+    """
+    sl = transformer_options.get("img_slice")
+    if not sl or len(sl) < 2:
+        return None
+    cap_len = int(sl[0])
+    # The key is published with two different meanings: Krea 2 writes
+    # [txtlen, TOTAL] (comfy/ldm/krea2/model.py) while Flux writes
+    # [txtlen, IMG_LEN] (comfy/ldm/flux/model.py). Disambiguate against the
+    # actual sequence rather than guessing — reading Flux's as Krea 2's
+    # would silently mis-bias every region.
+    if cap_len + int(sl[1]) == seqlen:
+        img_len = int(sl[1])          # [txt, img]
+    elif int(sl[1]) == seqlen:
+        img_len = int(sl[1]) - cap_len  # [txt, total]
+    else:
+        return None
+    if cap_len <= 0 or img_len <= 0:
+        return None
+    return cap_len, img_len, img_len
+
+
+def make_padded_length_provider(mask_token_count: int,
+                                pad_tokens_multiple: Optional[int]):
+    """Lengths for families that publish none but pad predictably (ZiT).
+
+    NextDiT pads BOTH the caption and image runs to `pad_tokens_multiple`,
+    so the padded image run is the mask token count rounded up, and the
+    caption is whatever remains. That same invariant doubles as the
+    validity check: a real joint [cap, img] sequence must leave a caption
+    that is itself a multiple of the granularity. Anything else — a
+    refiner pass, a reference-image sequence — fails it and is declined,
+    which is what kept this from being guessed wrong before (the
+    pre-2026-08-03 code inferred the caption by subtracting the *unpadded*
+    mask count and silently displaced every region).
+    """
+    raw = int(mask_token_count)
+    mult = int(pad_tokens_multiple) if pad_tokens_multiple else 0
+
+    def provider(transformer_options, seqlen) -> Optional[Tuple[int, int, int]]:
+        img_len = raw
+        if mult > 1:
+            rounded = -(-raw // mult) * mult
+            if rounded <= seqlen:
+                img_len = rounded
+        cap_len = seqlen - img_len
+        if cap_len <= 0:
+            return None
+        if mult > 1 and cap_len % mult:
+            return None  # not the joint sequence this bias describes
+        return cap_len, img_len, raw
+
+    return provider
+
+
+class FreeFuseAttentionOverride:
+    """Callable installed as transformer_options['optimized_attention_override']."""
+
+    def __init__(
+        self,
+        lora_masks: Dict[str, torch.Tensor],
+        token_pos_maps: Dict[str, List[List[int]]],
+        config,
+        block_indices: Sequence[int],
+        latent_size: Optional[Tuple[int, int]] = None,
+        cap_len_provider: Optional[Callable[[Any], Optional[Tuple[int, int]]]] = None,
+        previous_override: Optional[Callable] = None,
+    ):
+        self.cache = BiasVectorCache(
+            lora_masks, token_pos_maps, config, latent_size,
+            log_prefix="[FreeFuse attn-override]")
+        # block_indices is either a flat iterable of indices (families with
+        # one block type) or {block_type: indices}. Flux needs the latter:
+        # it numbers double and single blocks BOTH from zero, so a flat set
+        # would bias single block 3 whenever double block 3 was selected.
+        if isinstance(block_indices, dict):
+            self.blocks_by_type = {
+                str(t): {int(i) for i in idx}
+                for t, idx in block_indices.items()
+            }
+            self.blocks = None
+        else:
+            self.blocks_by_type = None
+            self.blocks = {int(i) for i in block_indices}
+        self.cap_len_provider = cap_len_provider or _lengths_from_img_slice
+        self.previous_override = previous_override
+        self.biased_calls = 0
+        self._skips: Dict[str, int] = {}
+        self._validated = False
+
+    # ---- bookkeeping ----------------------------------------------------
+
+    def _skip(self, reason: str, func, args, kwargs):
+        n = self._skips.get(reason, 0) + 1
+        self._skips[reason] = n
+        if n == 1:
+            logging.info(f"[FreeFuse attn-override] passing through: {reason}")
+        if self.previous_override is not None:
+            return self.previous_override(func, *args, **kwargs)
+        return func(*args, **kwargs)
+
+    def stats(self) -> Dict[str, Any]:
+        return {"biased_calls": self.biased_calls, "skipped": dict(self._skips)}
+
+    # ---- the override ---------------------------------------------------
+
+    def __call__(self, func, *args, **kwargs):
+        to = kwargs.get("transformer_options")
+        if not isinstance(to, dict):
+            return self._skip("no transformer_options", func, args, kwargs)
+
+        block_index = to.get("block_index")
+        if block_index is None:
+            # includes the refiner/txt-fusion passes, which run before the
+            # main loop publishes a block index
+            return self._skip("block not selected", func, args, kwargs)
+        if self.blocks_by_type is not None:
+            selected = self.blocks_by_type.get(str(to.get("block_type")))
+            if not selected or int(block_index) not in selected:
+                return self._skip("block not selected", func, args, kwargs)
+        elif int(block_index) not in self.blocks:
+            return self._skip("block not selected", func, args, kwargs)
+
+        if len(args) < 3:
+            return self._skip("unexpected attention signature", func, args, kwargs)
+        q, k, v = args[0], args[1], args[2]
+        heads = args[3] if len(args) > 3 else kwargs.get("heads")
+        mask = args[4] if len(args) > 4 else kwargs.get("mask")
+        skip_reshape = kwargs.get("skip_reshape", False)
+        skip_output_reshape = kwargs.get("skip_output_reshape", False)
+
+        if mask is not None:
+            # The bias would have to be combined with the model's own mask.
+            # Krea 2's main blocks pass None; ZiT does not (see module doc).
+            return self._skip("model supplied its own attention mask",
+                              func, args, kwargs)
+        if heads is None:
+            return self._skip("heads not resolvable", func, args, kwargs)
+
+        # normalise to (B, H, S, D)
+        if skip_reshape:
+            if q.dim() != 4:
+                return self._skip("unexpected q layout", func, args, kwargs)
+            qh, kh = q.shape[1], k.shape[1]
+            b, s = q.shape[0], q.shape[2]
+        else:
+            if q.dim() != 3:
+                return self._skip("unexpected q layout", func, args, kwargs)
+            b, s = q.shape[0], q.shape[1]
+            dim_head = q.shape[-1] // int(heads)
+            q = q.view(b, -1, int(heads), dim_head).transpose(1, 2)
+            k = k.view(b, -1, k.shape[-1] // dim_head, dim_head).transpose(1, 2)
+            v = v.view(b, -1, v.shape[-1] // dim_head, dim_head).transpose(1, 2)
+            qh, kh = q.shape[1], k.shape[1]
+
+        lengths = self.cap_len_provider(to, s)
+        if lengths is None:
+            return self._skip("sequence lengths unavailable", func, args, kwargs)
+        cap_len, img_len, real_img_len = lengths
+
+        if s != cap_len + img_len:
+            # refiner blocks, reference-image passes, anything whose
+            # sequence is not the joint [cap, img] the masks describe
+            return self._skip(
+                f"sequence {s} != cap {cap_len} + img {img_len}",
+                func, args, kwargs)
+
+        if kh != qh:  # GQA that the caller did not expand
+            if qh % kh:
+                return self._skip("non-divisible GQA", func, args, kwargs)
+            rep = qh // kh
+            k = k.repeat_interleave(rep, dim=1)
+            v = v.repeat_interleave(rep, dim=1)
+
+        try:
+            score_mod = self.cache.get(cap_len, img_len, q.device,
+                                       real_img_len=real_img_len)
+        except RuntimeError as e:
+            # adapter-count ceiling and mask/length mismatches land here;
+            # falling back keeps the render alive and says why, loudly
+            return self._skip(f"bias unavailable ({e})", func, args, kwargs)
+
+        out = get_compiled_flex()(q.contiguous(), k.contiguous(),
+                                  v.contiguous(), score_mod=score_mod)
+
+        if os.environ.get("FREEFUSE_OVERRIDE_VALIDATE") == "1" \
+                and not self._validated:
+            self._validated = True
+            self._validate(q, k, v, out, cap_len, img_len)
+
+        self.biased_calls += 1
+        if skip_output_reshape:
+            return out
+        return out.transpose(1, 2).reshape(b, s, -1)
+
+    def _validate(self, q, k, v, flex_out, cap_len, img_len):
+        if q.shape[2] > VALIDATE_MAX_SEQ:
+            logging.info(
+                "[FreeFuse attn-override] VALIDATE skipped: fp32 dense "
+                f"reference at S={q.shape[2]} would OOM")
+            return
+        import inspect
+        from .attention_bias import construct_attention_bias
+        cfg = self.cache.config
+        kwargs = dict(
+            lora_masks={n: m for n, m in self.cache.lora_masks.items()
+                        if not n.startswith("_")},
+            token_pos_maps=self.cache.token_pos_maps,
+            txt_seq_len=cap_len, img_seq_len=img_len,
+            bias_scale=cfg.bias_scale,
+            positive_bias_scale=cfg.positive_bias_scale,
+            bidirectional=cfg.bidirectional,
+            use_positive_bias=cfg.use_positive_bias,
+            device=q.device, dtype=torch.float32)
+        # img-img isolation is an optional extension; only pass it when this
+        # build of construct_attention_bias accepts it, so the override does
+        # not require that feature to be present.
+        if "img_img_bias_scale" in inspect.signature(
+                construct_attention_bias).parameters:
+            kwargs["img_img_bias_scale"] = getattr(
+                cfg, "img_img_bias_scale", 0.0)
+        bias = construct_attention_bias(**kwargs)
+        if bias.dim() == 3:
+            bias = bias.unsqueeze(1)
+        ref = F.scaled_dot_product_attention(
+            q.float(), k.float(), v.float(), attn_mask=bias)
+        diff = (ref - flex_out.float()).abs().max().item()
+        logging.info(f"[FreeFuse attn-override] VALIDATE max|flex-dense| "
+                     f"= {diff:.2e} (cap={cap_len} img={img_len})")
+
+
+def apply_freefuse_attention_override(
+    model,
+    lora_masks: Dict[str, torch.Tensor],
+    token_pos_maps: Dict[str, List[List[int]]],
+    config,
+    block_indices: Sequence[int],
+    latent_size: Optional[Tuple[int, int]] = None,
+    cap_len_provider: Optional[Callable] = None,
+) -> Optional[FreeFuseAttentionOverride]:
+    """Install the bias host on this model clone. Returns the host, or
+    None when the override route is unavailable (caller falls back)."""
+    if os.environ.get("FREEFUSE_ATTN_OVERRIDE", "1") == "0":
+        return None  # explicit opt-out
+    if not FLEX_AVAILABLE:
+        logging.info("[FreeFuse attn-override] flex_attention unavailable")
+        return None
+    if not override_mechanism_supported():
+        return None
+
+    live = len([n for n in lora_masks if not n.startswith("_")])
+    if live > MAX_ADAPTERS:
+        logging.info(
+            f"[FreeFuse attn-override] {live} adapters exceeds the "
+            f"unrolled score_mod's {MAX_ADAPTERS}; leaving the dense path "
+            "in place")
+        return None
+
+    to = model.model_options.setdefault("transformer_options", {})
+    host = FreeFuseAttentionOverride(
+        lora_masks, token_pos_maps, config, block_indices,
+        latent_size=latent_size,
+        cap_len_provider=cap_len_provider,
+        previous_override=to.get("optimized_attention_override"),
+    )
+    to["optimized_attention_override"] = host
+    logging.info(
+        f"[FreeFuse attn-override] installed for "
+        + (", ".join(f"{len(v)} {t}" for t, v in host.blocks_by_type.items())
+           if host.blocks_by_type is not None
+           else f"blocks {min(host.blocks)}..{max(host.blocks)} "
+                f"({len(host.blocks)} of them)")
+        + f", {live} adapters — O(S) bias in comfy's attention override")
+    return host
+
+
+def apply_zimage_attention_override(
+    model,
+    lora_masks: Dict[str, torch.Tensor],
+    token_pos_maps: Dict[str, List[List[int]]],
+    config,
+    layer_indices: Sequence[int],
+    latent_size: Optional[Tuple[int, int]] = None,
+    pad_tokens_multiple: Optional[int] = None,
+) -> Optional[FreeFuseAttentionOverride]:
+    """Z-Image consumer: same host, only the length source differs.
+
+    Lumina publishes no lengths in transformer_options, but it pads both
+    runs to a known multiple, so the lengths are recoverable arithmetically
+    from the mask token count — no capture hook, unlike the Krea 2 flex
+    path's `txtfusion` forward hook.
+    """
+    first = next((m for n, m in lora_masks.items() if not n.startswith("_")),
+                 None)
+    if first is None:
+        return None
+    mask_tokens = int(first.reshape(-1).numel())
+    return apply_freefuse_attention_override(
+        model, lora_masks=lora_masks, token_pos_maps=token_pos_maps,
+        config=config, block_indices=layer_indices, latent_size=latent_size,
+        cap_len_provider=make_padded_length_provider(mask_tokens,
+                                                     pad_tokens_multiple),
+    )
+
+
+def apply_flux_attention_override(
+    model,
+    lora_masks: Dict[str, torch.Tensor],
+    token_pos_maps: Dict[str, List[List[int]]],
+    config,
+    latent_size: Optional[Tuple[int, int]] = None,
+) -> Optional[FreeFuseAttentionOverride]:
+    """Flux / Flux 2 consumer.
+
+    This is the family the dense path actually breaks on: every patched
+    block keeps its own (S, S) cache, so Klein 9B's 32 blocks cost ~15.6 GB
+    of bias alone at 4 MP and the confined continuation OOMs. Here it is a
+    handful of O(S) vectors.
+
+    Two Flux-specific details: double and single blocks are numbered from
+    zero independently, so selection is keyed by (block_type, index); and
+    `img_slice` is published only for single blocks, in Flux's own
+    [txt, img] form, so double blocks fall back to deriving the caption
+    length from the mask token count (Flux does not pad the sequence).
+    """
+    diffusion_model = model.model.diffusion_model
+    try:
+        n_double = len(diffusion_model.double_blocks)
+        n_single = len(diffusion_model.single_blocks)
+    except AttributeError:
+        logging.info("[FreeFuse attn-override] not a Flux block layout")
+        return None
+
+    by_type = {
+        "double": {i for i in range(n_double)
+                   if config.should_apply_to_block(f"transformer_blocks.{i}")},
+        "single": {i for i in range(n_single)
+                   if config.should_apply_to_block(
+                       f"single_transformer_blocks.{i}")},
+    }
+    if not by_type["double"] and not by_type["single"]:
+        logging.info("[FreeFuse attn-override] no Flux blocks selected")
+        return None
+
+    first = next((m for n, m in lora_masks.items() if not n.startswith("_")),
+                 None)
+    if first is None:
+        return None
+    arithmetic = make_padded_length_provider(int(first.reshape(-1).numel()),
+                                             None)
+
+    def provider(transformer_options, seqlen):
+        # single blocks publish img_slice; double blocks do not
+        got = _lengths_from_img_slice(transformer_options, seqlen)
+        return got if got is not None else arithmetic(transformer_options,
+                                                      seqlen)
+
+    host = apply_freefuse_attention_override(
+        model, lora_masks=lora_masks, token_pos_maps=token_pos_maps,
+        config=config, block_indices=by_type, latent_size=latent_size,
+        cap_len_provider=provider,
+    )
+    if host is not None:
+        logging.info(
+            f"[FreeFuse attn-override] Flux blocks selected: "
+            f"{len(by_type['double'])}/{n_double} double, "
+            f"{len(by_type['single'])}/{n_single} single")
+    return host
+
+
+__all__ = [
+    "FreeFuseAttentionOverride",
+    "apply_freefuse_attention_override",
+    "apply_zimage_attention_override",
+    "apply_flux_attention_override",
+    "make_padded_length_provider",
+]

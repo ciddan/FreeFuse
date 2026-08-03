@@ -260,19 +260,33 @@ When enabled, constructs soft attention bias to guide cross-attention:
                 mask_flat = mask.reshape(-1)
                 lora_masks_flat[name] = mask_flat.unsqueeze(0)  # Add batch dim
             
-            # Apply attention bias patches with dynamic bias construction
-            # Bias will be built at runtime based on actual txt/img sequence lengths
-            apply_attention_bias_patches(
-                model_patcher=model_patcher,
-                attention_bias=None,  # Not used - bias built dynamically
-                config=config,
-                txt_seq_len=txt_seq_len,  # Estimate - actual determined at runtime
-                model_type="flux",
+            # Prefer comfy's attention override: the dense path below keeps a
+            # full (S, S) bias per patched block, which is what makes a
+            # confined pass OOM at high resolution (Flux 2 Klein 9B: 32 blocks
+            # x ~500 MB at 4 MP). The override computes the same bias inside
+            # the attention kernel from O(S) vectors.
+            from ..freefuse_core.attention_override import \
+                apply_flux_attention_override
+            flux_host = apply_flux_attention_override(
+                model_patcher,
                 lora_masks=lora_masks_flat,
                 token_pos_maps=token_pos_maps,
+                config=config,
+                latent_size=latent_size,
             )
+            if flux_host is None:
+                apply_attention_bias_patches(
+                    model_patcher=model_patcher,
+                    attention_bias=None,  # Not used - bias built dynamically
+                    config=config,
+                    txt_seq_len=txt_seq_len,  # Estimate - actual at runtime
+                    model_type="flux",
+                    lora_masks=lora_masks_flat,
+                    token_pos_maps=token_pos_maps,
+                )
             print(f"[FreeFuse] Applied attention bias for {model_type} "
-                  f"(bias_scale={bias_scale}, positive_scale={positive_bias_scale}, "
+                  f"({'attn-override' if flux_host is not None else 'dense'} path, "
+                  f"bias_scale={bias_scale}, positive_scale={positive_bias_scale}, "
                   f"bidirectional={bidirectional}, blocks={bias_blocks})")
         
         elif model_type == "z_image":
@@ -329,15 +343,27 @@ When enabled, constructs soft attention bias to guide cross-attention:
 
             krea2_block_indices = self._resolve_krea2_bias_blocks(model_patcher, bias_blocks)
 
-            apply_krea2_bias_patches(
+            from ..freefuse_core.attention_override import \
+                apply_freefuse_attention_override
+            krea2_host = apply_freefuse_attention_override(
                 model_patcher,
                 lora_masks=lora_masks_flat,
                 token_pos_maps=token_pos_maps,
                 config=config,
                 block_indices=krea2_block_indices,
+                latent_size=latent_size,
             )
+            if krea2_host is None:
+                apply_krea2_bias_patches(
+                    model_patcher,
+                    lora_masks=lora_masks_flat,
+                    token_pos_maps=token_pos_maps,
+                    config=config,
+                    block_indices=krea2_block_indices,
+                )
             print(f"[FreeFuse] Applied attention bias for Krea2 "
-                  f"(bias_scale={bias_scale}, positive_scale={positive_bias_scale}, "
+                  f"({'attn-override' if krea2_host is not None else 'dense'} path, "
+                  f"bias_scale={bias_scale}, positive_scale={positive_bias_scale}, "
                   f"blocks={bias_blocks} -> {krea2_block_indices})")
 
         else:  # SDXL
