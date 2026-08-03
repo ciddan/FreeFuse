@@ -852,16 +852,43 @@ class MultiAdapterBypassForwardHook:
             if self._adapter_needs_device_move(adapter, x.device):
                 self._move_adapter_weights_to_device(adapter, x.device, dtype=None)
 
-            h_out = adapter.h(x, base_out)
-            
+            # Sequence-chunked delta: adapter.h materializes an
+            # (B, seq, out_features) intermediate PLUS its `out * scale`
+            # copy — ~570 MB fp32 per hooked fused-QKV layer at 3 MP, the
+            # actual source of the post-upscale bypass-transient OOM.
+            # Chunking the sequence bounds the transient at chunk-size
+            # cost with bitwise-identical math (LoRA is per-token).
+            chunk = int(os.environ.get("FREEFUSE_H_CHUNK", "4096"))
+            if (base_out.dim() == 3 and chunk > 0
+                    and base_out.shape[1] > chunk
+                    and (offset is None or offset[0] == 0)):
+                h_out = None  # computed per-chunk below
+            else:
+                h_out = adapter.h(x, base_out)
+
             # Apply FreeFuse mask if available AND this layer should have mask applied
             # Check _should_apply_spatial_mask to match diffusers implementation
             should_apply = self._should_apply_spatial_mask()
+            mask = None
             if self.mask_enabled and adapter_name and seq_len is not None and should_apply:
                 mask = self._get_mask_for_sequence(
-                    adapter_name, seq_len, h_out.device, h_out.dtype
+                    adapter_name, seq_len, base_out.device, base_out.dtype
                 )
-                if mask is not None:
+
+            if h_out is None:
+                # chunked path: mask + offset-place each slice immediately
+                _, start_, size_ = (offset if offset is not None
+                                    else (0, 0, base_out.shape[-1]))
+                for c0 in range(0, base_out.shape[1], chunk):
+                    c1 = min(c0 + chunk, base_out.shape[1])
+                    h_c = adapter.h(x[:, c0:c1], base_out[:, c0:c1])
+                    if mask is not None:
+                        h_c = h_c * mask[c0:c1].view(1, -1, 1)
+                    total_h[:, c0:c1, start_:start_ + size_] += h_c
+                    del h_c
+                continue
+
+            if mask is not None:
                     # Debug: log mask application (only once per adapter)
                     debug_key = f"_mask_debug_{adapter_name}"
                     if not hasattr(self, debug_key):
