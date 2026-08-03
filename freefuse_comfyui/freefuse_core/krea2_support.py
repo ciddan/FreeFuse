@@ -312,6 +312,7 @@ class FreeFuseKrea2BiasBlockReplace:
             positive_bias_scale=self.config.positive_bias_scale,
             bidirectional=self.config.bidirectional,
             use_positive_bias=self.config.use_positive_bias,
+            img_img_bias_scale=getattr(self.config, 'img_img_bias_scale', 0.0),
             device=device,
             dtype=dtype,
         )
