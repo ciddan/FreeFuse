@@ -6,6 +6,7 @@ These nodes provide an optional debug/advanced path:
 - FreeFuseMaskReassemble: normalize and forward edited mask bank
 """
 
+import math
 import os
 import re
 import uuid
@@ -77,6 +78,27 @@ def _resize_2d(
 
 def _binarize_2d(mask_2d: torch.Tensor, threshold: float = _MASK_BINARY_THRESHOLD) -> torch.Tensor:
     return (mask_2d.float() >= float(threshold)).float()
+
+
+def _feather_2d(mask_2d: torch.Tensor, feather_cells: float) -> torch.Tensor:
+    """Gaussian-blur a grid-resolution mask by ~feather_cells token cells.
+
+    Turns the seam between adjacent regions into a short cross-fade ramp
+    instead of a one-cell cliff in the LoRA delta / attention bias.
+    """
+    if feather_cells <= 0:
+        return mask_2d
+    sigma = float(feather_cells) / 1.5
+    radius = max(1, int(math.ceil(2.0 * sigma)))
+    coords = torch.arange(-radius, radius + 1, dtype=torch.float32)
+    kernel_1d = torch.exp(-(coords ** 2) / (2.0 * sigma ** 2))
+    kernel_1d = kernel_1d / kernel_1d.sum()
+    m = mask_2d.float().unsqueeze(0).unsqueeze(0)
+    kh = kernel_1d.view(1, 1, -1, 1).to(m.device)
+    kw = kernel_1d.view(1, 1, 1, -1).to(m.device)
+    m = F.conv2d(m, kh, padding=(radius, 0))
+    m = F.conv2d(m, kw, padding=(0, radius))
+    return m.squeeze(0).squeeze(0).clamp(0.0, 1.0)
 
 
 def _parse_image_ref(value) -> Tuple[Optional[str], Optional[str]]:
@@ -278,8 +300,16 @@ def _load_mask_from_image_tensor(
     invert_alpha: bool = False,
     threshold: float = _MASK_BINARY_THRESHOLD,
     binarize: bool = True,
+    soft: bool = False,
     warning_prefix: str = "[FreeFuseMaskBankFromImages]",
 ) -> Optional[torch.Tensor]:
+    """Load a 2D mask from an IMAGE tensor.
+
+    soft=True: binarize at NATIVE resolution, then AREA-average down to the
+    target grid — each token cell gets its fractional pixel coverage in
+    [0, 1] instead of a nearest-sampled hard 0/1. Thin structures (crossing
+    arms, hair strands) contribute proportionally instead of aliasing.
+    """
     if not isinstance(image_tensor, torch.Tensor):
         return None
 
@@ -302,6 +332,11 @@ def _load_mask_from_image_tensor(
             mask_2d = img[..., 0].clamp(0.0, 1.0)
 
         mask_2d = mask_2d.float()
+        if bool(soft):
+            mask_2d = _binarize_2d(mask_2d, threshold)
+            if target_h is not None and target_w is not None:
+                mask_2d = _resize_2d(mask_2d, int(target_h), int(target_w), mode="area")
+            return mask_2d.clamp(0.0, 1.0)
         if target_h is not None and target_w is not None:
             mask_2d = _resize_2d(mask_2d, int(target_h), int(target_w), mode="nearest")
         if bool(binarize):
@@ -386,6 +421,18 @@ class FreeFuseMaskBankFromImages:
                 "use_alpha": ("BOOLEAN", {"default": True}),
                 "invert_alpha": ("BOOLEAN", {"default": False}),
                 "threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "soft_masks": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Area-average masks down to the token grid instead of "
+                               "nearest+binarize: each cell gets fractional pixel coverage, "
+                               "so thin structures stop aliasing and seams stop being "
+                               "one-cell cliffs. Off = legacy behavior."}),
+                "feather_cells": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 4.0, "step": 0.5,
+                    "tooltip": "With soft_masks: Gaussian cross-fade at region seams, in "
+                               "token cells (1 cell = 16 px). Overlapping ramps are "
+                               "renormalized so the summed LoRA weight never exceeds 1. "
+                               "0 = no feather."}),
             },
         }
 
@@ -432,6 +479,8 @@ class FreeFuseMaskBankFromImages:
         use_alpha=True,
         invert_alpha=False,
         threshold=0.5,
+        soft_masks=False,
+        feather_cells=0.0,
         **kwargs,
     ):
         adapter_names = self._adapter_names(freefuse_data)
@@ -461,6 +510,7 @@ class FreeFuseMaskBankFromImages:
                 invert_alpha=bool(invert_alpha),
                 threshold=float(threshold),
                 binarize=True,
+                soft=bool(soft_masks),
                 warning_prefix="[FreeFuseMaskBankFromImages]",
             )
             if mask is None:
@@ -470,12 +520,29 @@ class FreeFuseMaskBankFromImages:
             masks[adapter_name] = mask.float()
             slot_masks.append(mask.float())
 
+        if bool(soft_masks) and masks:
+            if float(feather_cells) > 0:
+                masks = {name: _feather_2d(m, float(feather_cells))
+                         for name, m in masks.items()}
+            # Renormalize where overlapping ramps sum past 1 so no cell
+            # receives more than one full LoRA delta in total.
+            total = torch.stack(list(masks.values()), dim=0).sum(dim=0)
+            scale = torch.where(total > 1.0, 1.0 / total.clamp(min=1e-6),
+                                torch.ones_like(total))
+            masks = {name: (m * scale).clamp(0.0, 1.0)
+                     for name, m in masks.items()}
+            slot_masks = [masks.get(adapter_names[i])
+                          if i < len(adapter_names) else None
+                          for i in range(10)]
+
         mask_bank = {
             "masks": masks,
             "similarity_maps": {},
             "metadata": {
                 "adapter_names": adapter_names,
                 "source": "mask_images",
+                "soft_masks": bool(soft_masks),
+                "feather_cells": float(feather_cells),
             },
         }
         slot_names = "\n".join(slot_lines)
@@ -497,8 +564,10 @@ class FreeFuseMaskBankFromImages:
                 m2d = torch.zeros((preview_h, preview_w), dtype=torch.float32)
             else:
                 m2d = _resize_2d(m2d.float(), preview_h, preview_w, mode="nearest")
+            if not bool(soft_masks):
+                m2d = _binarize_2d(m2d)
             img = (
-                _binarize_2d(m2d)
+                m2d
                 .clamp(0.0, 1.0)
                 .detach()
                 .cpu()
