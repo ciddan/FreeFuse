@@ -285,16 +285,17 @@ When enabled, constructs soft attention bias to guide cross-attention:
                   f"bidirectional={bidirectional}, blocks={bias_blocks})")
         
         elif model_type == "z_image":
-            # Z-Image uses unified [img, txt] sequence (image FIRST)
+            # Z-Image (Lumina2/NextDiT): comfy's forward consults no
+            # patches_replace, so the old set_model_patch_replace route was a
+            # silent no-op (bias-on == bias-off, verified). Use per-call
+            # forward hooks scoped to this model clone instead (krea2-style).
+            from ..freefuse_core.zimage_support import (
+                apply_zimage_bias_patches,
+                resolve_zimage_bias_layers,
+            )
+
             img_seq_len = latent_h * latent_w
-            
-            # Estimate cap_seq_len from token_pos_maps
-            cap_seq_len = 256  # Default for Qwen3 tokenizer
-            for positions_list in token_pos_maps.values():
-                if positions_list and positions_list[0]:
-                    max_pos = max(positions_list[0])
-                    cap_seq_len = max(cap_seq_len, max_pos + 10)
-            
+
             # Flatten masks to (B, img_seq_len)
             lora_masks_flat = {}
             for name, mask in mask_dict.items():
@@ -304,19 +305,21 @@ When enabled, constructs soft attention bias to guide cross-attention:
                     mask = mask[0]
                 mask_flat = mask.reshape(-1)
                 lora_masks_flat[name] = mask_flat.unsqueeze(0)  # Add batch dim
-            
-            apply_attention_bias_patches(
-                model_patcher=model_patcher,
-                attention_bias=None,
-                config=config,
-                txt_seq_len=cap_seq_len,
-                model_type="z_image",
+
+            zimage_layers = resolve_zimage_bias_layers(
+                self._get_diffusion_model(model_patcher), bias_blocks)
+
+            apply_zimage_bias_patches(
+                model_patcher,
                 lora_masks=lora_masks_flat,
                 token_pos_maps=token_pos_maps,
+                config=config,
+                layer_indices=zimage_layers,
             )
             print(f"[FreeFuse] Applied attention bias for Z-Image "
                   f"(bias_scale={bias_scale}, positive_scale={positive_bias_scale}, "
-                  f"bidirectional={bidirectional}, img_seq={img_seq_len}, cap_seq={cap_seq_len})")
+                  f"bidirectional={bidirectional}, img_seq={img_seq_len}, "
+                  f"blocks={bias_blocks} -> {len(zimage_layers)} layers, per-call hooks)")
 
         elif model_type == "krea2":
             # Krea2 is single-stream, [txt, img] sequence (text FIRST, same as Z-Image's
