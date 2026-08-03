@@ -110,7 +110,17 @@ def _lengths_from_img_slice(transformer_options, seqlen) -> Optional[Tuple[int, 
     if not sl or len(sl) < 2:
         return None
     cap_len = int(sl[0])
-    img_len = int(sl[1]) - cap_len
+    # The key is published with two different meanings: Krea 2 writes
+    # [txtlen, TOTAL] (comfy/ldm/krea2/model.py) while Flux writes
+    # [txtlen, IMG_LEN] (comfy/ldm/flux/model.py). Disambiguate against the
+    # actual sequence rather than guessing — reading Flux's as Krea 2's
+    # would silently mis-bias every region.
+    if cap_len + int(sl[1]) == seqlen:
+        img_len = int(sl[1])          # [txt, img]
+    elif int(sl[1]) == seqlen:
+        img_len = int(sl[1]) - cap_len  # [txt, total]
+    else:
+        return None
     if cap_len <= 0 or img_len <= 0:
         return None
     return cap_len, img_len, img_len
