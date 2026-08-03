@@ -59,8 +59,16 @@ except Exception:
 # back (loud failure over silent catastrophe).
 try:
     import torch._dynamo as _dynamo
-    _dynamo.config.cache_size_limit = max(
-        getattr(_dynamo.config, "cache_size_limit", 8), 64)
+    # torch >= 2.10 renamed the operative knob to recompile_limit;
+    # cache_size_limit still exists but is no longer consulted (verified
+    # against the convert_frame warning). Set every spelling.
+    for _name, _val in (("recompile_limit", 64),
+                        ("accumulated_recompile_limit", 512),
+                        ("cache_size_limit", 64),
+                        ("accumulated_cache_size_limit", 512)):
+        if hasattr(_dynamo.config, _name):
+            setattr(_dynamo.config, _name,
+                    max(getattr(_dynamo.config, _name) or 0, _val))
     if hasattr(_dynamo.config, "fail_on_recompile_limit_hit"):
         _dynamo.config.fail_on_recompile_limit_hit = True
 except Exception as e:
