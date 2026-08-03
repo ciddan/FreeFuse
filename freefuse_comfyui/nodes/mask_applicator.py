@@ -341,16 +341,30 @@ When enabled, constructs soft attention bias to guide cross-attention:
 
             krea2_block_indices = self._resolve_krea2_bias_blocks(model_patcher, bias_blocks)
 
-            apply_krea2_bias_patches(
+            # FlexAttention path: bias computed in-kernel from O(S) vectors —
+            # no dense (S,S) matrix, no per-head expansion transient. Falls
+            # back to the legacy dense-mask path when flex is unavailable or
+            # FREEFUSE_KREA2_DENSE=1.
+            from ..freefuse_core.krea2_flex_bias import apply_krea2_flex_bias_patches
+            used_flex = apply_krea2_flex_bias_patches(
                 model_patcher,
                 lora_masks=lora_masks_flat,
                 token_pos_maps=token_pos_maps,
                 config=config,
                 block_indices=krea2_block_indices,
             )
+            if not used_flex:
+                apply_krea2_bias_patches(
+                    model_patcher,
+                    lora_masks=lora_masks_flat,
+                    token_pos_maps=token_pos_maps,
+                    config=config,
+                    block_indices=krea2_block_indices,
+                )
             print(f"[FreeFuse] Applied attention bias for Krea2 "
-                  f"(bias_scale={bias_scale}, positive_scale={positive_bias_scale}, "
-                  f"blocks={bias_blocks} -> {krea2_block_indices})")
+                  f"({'flex' if used_flex else 'dense'} path, "
+                  f"bias_scale={bias_scale}, positive_scale={positive_bias_scale}, "
+                  f"blocks={bias_blocks} -> {krea2_block_indices[0]}..{krea2_block_indices[-1]})")
 
         else:  # SDXL
             # For SDXL, use the direct SDXL bias patches
