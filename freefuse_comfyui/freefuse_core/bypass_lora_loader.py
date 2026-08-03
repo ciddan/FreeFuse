@@ -267,6 +267,11 @@ class MultiAdapterBypassForwardHook:
         self.latent_size: Optional[Tuple[int, int]] = None  # (H, W) of latent
         self.mask_enabled: bool = False
         self.txt_len: int = 256  # Default Flux txt length (CLIP + T5)
+        # Sequence padding granularity (NextDiT/Z-Image pads BOTH the caption
+        # and the image token runs up to a multiple of this). Without it the
+        # image padding is charged to the caption and every spatial mask
+        # lands `pad_extra` tokens late. None = model does not pad.
+        self.pad_tokens_multiple: Optional[int] = None
         
         # LoRA enable/disable support (for Phase 1 mask collection)
         self.lora_enabled: bool = True
@@ -296,6 +301,7 @@ class MultiAdapterBypassForwardHook:
         new_obj.latent_size = copy.deepcopy(self.latent_size, memo)
         new_obj.mask_enabled = self.mask_enabled
         new_obj.txt_len = self.txt_len
+        new_obj.pad_tokens_multiple = self.pad_tokens_multiple
         new_obj.lora_enabled = self.lora_enabled
         new_obj._should_apply_mask_cached = self._should_apply_mask_cached
         new_obj._mask_type_cached = self._mask_type_cached
@@ -341,6 +347,7 @@ class MultiAdapterBypassForwardHook:
         masks: Dict[str, torch.Tensor],
         latent_size: Tuple[int, int],
         txt_len: int = 256,
+        pad_tokens_multiple: Optional[int] = None,
     ):
         """
         Set FreeFuse masks for spatial LoRA application.
@@ -354,6 +361,7 @@ class MultiAdapterBypassForwardHook:
         self.latent_size = latent_size
         self.mask_enabled = True
         self.txt_len = txt_len
+        self.pad_tokens_multiple = pad_tokens_multiple
         logging.debug(f"[OffsetBypass] Set masks for {len(masks)} adapters, latent_size={latent_size}, txt_len={txt_len}")
     
     def clear_masks(self):
@@ -608,7 +616,20 @@ class MultiAdapterBypassForwardHook:
                 img_len = mask.shape[0] * mask.shape[1]
             else:
                 img_len = mask.numel()
-            cap_len = seq_len - img_len
+            # NextDiT pads the caption and image runs to pad_tokens_multiple
+            # (pad_zimage). The mask covers only REAL image tokens, so
+            # subtracting it from seq_len charges the image padding to the
+            # caption and lands the mask pad_extra tokens late. Round the
+            # image run up first; the caption is padded to the same multiple,
+            # so cap_len then comes out exact. img_len stays the real count
+            # (the resize path and the placement below both want it).
+            padded_img_len = img_len
+            mult = self.pad_tokens_multiple
+            if mult and mult > 1:
+                rounded = -(-img_len // mult) * mult
+                if rounded <= seq_len:
+                    padded_img_len = rounded
+            cap_len = seq_len - padded_img_len
             if cap_len < 0:
                 # Mask is larger than sequence, fallback: entire sequence is image
                 img_len = seq_len
@@ -683,6 +704,10 @@ class MultiAdapterBypassForwardHook:
             # (ComfyUI's NextDiT: padded_full_embed = torch.cat(feats + (x,), dim=1))
             full_mask = torch.ones(seq_len, device=device, dtype=dtype)
             full_mask[cap_len:cap_len + img_len] = mask_flat[:img_len].to(device=device, dtype=dtype)
+            # Trailing image padding belongs to no character's region;
+            # leaving it at 1.0 applies every LoRA fully to pad tokens.
+            if cap_len + img_len < seq_len:
+                full_mask[cap_len + img_len:] = 0.0
         elif mask_type == 'img_with_text':
             # Flux single stream: txt tokens come first, then img tokens
             # Layout: [txt_tokens(1.0), img_tokens(spatial mask)]
@@ -965,6 +990,7 @@ class OffsetBypassInjectionManager:
         self._pending_masks: Optional[Dict[str, torch.Tensor]] = None
         self._pending_latent_size: Optional[Tuple[int, int]] = None
         self._pending_txt_len: int = 256
+        self._pending_pad_tokens_multiple: Optional[int] = None
 
         # Track which model instance the current `hooks` list was built for.
         # ModelPatcher.clone() deepcopies model_options, which can leave hooks
@@ -1123,7 +1149,9 @@ class OffsetBypassInjectionManager:
                     hook.set_masks(
                         current_manager._pending_masks,
                         current_manager._pending_latent_size,
-                        current_manager._pending_txt_len
+                        current_manager._pending_txt_len,
+                        pad_tokens_multiple=getattr(
+                            current_manager, "_pending_pad_tokens_multiple", None),
                     )
         
         def eject_all(model_patcher):
@@ -1173,6 +1201,7 @@ class OffsetBypassInjectionManager:
         masks: Dict[str, torch.Tensor],
         latent_size: Tuple[int, int],
         txt_len: int = 256,
+        pad_tokens_multiple: Optional[int] = None,
     ):
         """
         Set FreeFuse masks on all hooks.
@@ -1189,6 +1218,7 @@ class OffsetBypassInjectionManager:
         self._pending_masks = masks
         self._pending_latent_size = latent_size
         self._pending_txt_len = txt_len
+        self._pending_pad_tokens_multiple = pad_tokens_multiple
         
         # Apply to existing hooks immediately (if already injected)
         hooks_updated = 0
@@ -1200,7 +1230,8 @@ class OffsetBypassInjectionManager:
                 and current_forward.__self__ is hook
             )
             if is_injected:
-                hook.set_masks(masks, latent_size, txt_len)
+                hook.set_masks(masks, latent_size, txt_len,
+                               pad_tokens_multiple=pad_tokens_multiple)
                 hooks_updated += 1
         
         if hooks_updated > 0:
