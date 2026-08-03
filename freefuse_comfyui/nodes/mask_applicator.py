@@ -315,6 +315,9 @@ When enabled, constructs soft attention bias to guide cross-attention:
                 token_pos_maps=token_pos_maps,
                 config=config,
                 layer_indices=zimage_layers,
+                pad_tokens_multiple=getattr(
+                    self._get_diffusion_model(model_patcher),
+                    "pad_tokens_multiple", None),
             )
             print(f"[FreeFuse] Applied attention bias for Z-Image "
                   f"(bias_scale={bias_scale}, positive_scale={positive_bias_scale}, "
@@ -482,6 +485,13 @@ When enabled, constructs soft attention bias to guide cross-attention:
         # In practice, the actual length depends on the prompt
         freefuse_data = transformer_options.get("freefuse_data", {})
         txt_len = freefuse_data.get("txt_len", 512)  # Default for Flux CLIP+T5
+
+        # NextDiT/Z-Image pads the caption and image token runs up to this
+        # multiple. The hooks need it to place spatial masks correctly;
+        # None for families that do not pad.
+        pad_tokens_multiple = getattr(
+            getattr(model_patcher.model, "diffusion_model", None),
+            "pad_tokens_multiple", None)
         
         # Look for multiple bypass managers (one per LoRA)
         managers_list = transformer_options.get("freefuse_bypass_managers", [])
@@ -491,7 +501,9 @@ When enabled, constructs soft attention bias to guide cross-attention:
             for manager_info in managers_list:
                 manager = manager_info.get("manager")
                 if manager is not None and isinstance(manager, OffsetBypassInjectionManager):
-                    manager.set_masks(masks, latent_size, txt_len, token_pos_maps=token_pos_maps)
+                    manager.set_masks(masks, latent_size, txt_len,
+                                      token_pos_maps=token_pos_maps,
+                                      pad_tokens_multiple=pad_tokens_multiple)
                     hooks_updated += manager.get_hook_count()
 
             if hooks_updated > 0:
@@ -502,13 +514,16 @@ When enabled, constructs soft attention bias to guide cross-attention:
         # Fallback: Single manager
         manager = transformer_options.get("freefuse_bypass_manager")
         if manager is not None and isinstance(manager, OffsetBypassInjectionManager):
-            manager.set_masks(masks, latent_size, txt_len, token_pos_maps=token_pos_maps)
+            manager.set_masks(masks, latent_size, txt_len,
+                              token_pos_maps=token_pos_maps,
+                              pad_tokens_multiple=pad_tokens_multiple)
             logging.info(f"[FreeFuse] Applied masks via single bypass manager ({manager.get_hook_count()} hooks), txt_len={txt_len}, "
                          f"token_masking={'on' if token_pos_maps else 'off'}")
             return
         
         # Fallback: Look for hooks in model traversal
-        hooks_found = self._find_hooks_in_model(model_patcher, masks, latent_size, txt_len, token_pos_maps)
+        hooks_found = self._find_hooks_in_model(model_patcher, masks, latent_size, txt_len, token_pos_maps,
+                                                pad_tokens_multiple=pad_tokens_multiple)
         if hooks_found > 0:
             logging.info(f"[FreeFuse] Applied masks to {hooks_found} hooks via model traversal")
             return
@@ -524,6 +539,7 @@ When enabled, constructs soft attention bias to guide cross-attention:
         latent_size: Tuple[int, int],
         txt_len: int = 512,
         token_pos_maps: Optional[Dict] = None,
+        pad_tokens_multiple: Optional[int] = None,
     ) -> int:
         """Find MultiAdapterBypassForwardHook instances in the model and set masks."""
         hooks_found = 0
@@ -542,7 +558,9 @@ When enabled, constructs soft attention bias to guide cross-attention:
                 if hasattr(forward, '__self__'):
                     hook_self = forward.__self__
                     if isinstance(hook_self, MultiAdapterBypassForwardHook):
-                        hook_self.set_masks(masks, latent_size, txt_len, token_pos_maps=token_pos_maps)
+                        hook_self.set_masks(masks, latent_size, txt_len,
+                                            token_pos_maps=token_pos_maps,
+                                            pad_tokens_multiple=pad_tokens_multiple)
                         hooks_found += 1
 
         return hooks_found

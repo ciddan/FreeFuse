@@ -38,12 +38,14 @@ class FreeFuseZImageBiasHooks:
         config,
         diffusion_model,
         layer_indices: List[int],
+        pad_tokens_multiple: Optional[int] = None,
     ):
         self.lora_masks = lora_masks
         self.token_pos_maps = token_pos_maps
         self.config = config
         self.diffusion_model = diffusion_model
         self.layer_indices = {int(i) for i in layer_indices}
+        self.pad_tokens_multiple = pad_tokens_multiple
         self._bias_cache: Dict[Tuple[int, int], Optional[torch.Tensor]] = {}
         self._hook_handles: List[Any] = []
         self._construct_attention_bias = None
@@ -93,14 +95,22 @@ class FreeFuseZImageBiasHooks:
             h.remove()
         self._hook_handles.clear()
 
-    def _get_or_build_bias(self, img_len, cap_len, device, dtype):
+    def _get_or_build_bias(self, img_len, cap_len, device, dtype,
+                           real_img_len=None):
         key = (img_len, cap_len)
         if key in self._bias_cache:
             cached = self._bias_cache[key]
             return cached.to(device=device, dtype=dtype) if cached is not None else None
 
+        masks = self.lora_masks
+        if real_img_len is not None and real_img_len < img_len:
+            # zero-pad each mask over the image padding tail: those tokens
+            # belong to no character's region
+            pad = img_len - real_img_len
+            masks = {n: torch.nn.functional.pad(m.reshape(1, -1), (0, pad))
+                     for n, m in masks.items()}
         bias = self._construct_attention_bias(
-            lora_masks=self.lora_masks,
+            lora_masks=masks,
             token_pos_maps=self.token_pos_maps,
             txt_seq_len=cap_len,
             img_seq_len=img_len,
@@ -122,7 +132,17 @@ class FreeFuseZImageBiasHooks:
                 return None
             x = args[0]
             seqlen = int(x.shape[1])
-            img_len = self._img_len
+            # NextDiT pads the caption and image runs to pad_tokens_multiple.
+            # The masks cover only real image tokens, so subtracting them
+            # from seqlen charges the image padding to the caption and
+            # displaces every region by pad_extra.
+            real_img_len = self._img_len
+            img_len = real_img_len
+            mult = self.pad_tokens_multiple
+            if mult and mult > 1:
+                rounded = -(-real_img_len // mult) * mult
+                if rounded <= seqlen:
+                    img_len = rounded
             cap_len = seqlen - img_len
             if cap_len <= 0:
                 raise RuntimeError(
@@ -130,7 +150,8 @@ class FreeFuseZImageBiasHooks:
                     f"img_len={img_len} (from lora masks), cap_len={cap_len}"
                 )
 
-            bias = self._get_or_build_bias(img_len, cap_len, x.device, x.dtype)
+            bias = self._get_or_build_bias(img_len, cap_len, x.device, x.dtype,
+                                          real_img_len=real_img_len)
             if bias is None:
                 return None
             if bias.dim() == 3:
@@ -198,6 +219,7 @@ def apply_zimage_bias_patches(
     token_pos_maps: Dict[str, List[List[int]]],
     config,
     layer_indices: Optional[List[int]] = None,
+    pad_tokens_multiple: Optional[int] = None,
 ):
     """Register the per-call bias wrapper on this model clone (krea2-style)."""
     diffusion_model = model.model.diffusion_model
@@ -215,7 +237,8 @@ def apply_zimage_bias_patches(
 
     def zimage_bias_wrapper(apply_model_fn, args):
         hooks = FreeFuseZImageBiasHooks(
-            lora_masks, token_pos_maps, config, diffusion_model, layer_indices
+            lora_masks, token_pos_maps, config, diffusion_model, layer_indices,
+            pad_tokens_multiple=pad_tokens_multiple,
         )
         hooks.install()
         try:
