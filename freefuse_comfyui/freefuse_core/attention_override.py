@@ -52,8 +52,12 @@ from .flex_bias_core import (
 VALIDATE_MAX_SEQ = 9000  # above this the dense reference is itself an OOM
 
 
-def _lengths_from_img_slice(transformer_options) -> Optional[Tuple[int, int]]:
-    """Krea 2 publishes [txtlen, total] — cap_len and img_len for free."""
+def _lengths_from_img_slice(transformer_options, seqlen) -> Optional[Tuple[int, int, int]]:
+    """Krea 2 publishes [txtlen, total] — cap_len and img_len for free.
+
+    Returns (cap_len, img_len, real_img_len); Krea 2 does not pad its
+    image run, so the last two are the same.
+    """
     sl = transformer_options.get("img_slice")
     if not sl or len(sl) < 2:
         return None
@@ -61,7 +65,40 @@ def _lengths_from_img_slice(transformer_options) -> Optional[Tuple[int, int]]:
     img_len = int(sl[1]) - cap_len
     if cap_len <= 0 or img_len <= 0:
         return None
-    return cap_len, img_len
+    return cap_len, img_len, img_len
+
+
+def make_padded_length_provider(mask_token_count: int,
+                                pad_tokens_multiple: Optional[int]):
+    """Lengths for families that publish none but pad predictably (ZiT).
+
+    NextDiT pads BOTH the caption and image runs to `pad_tokens_multiple`,
+    so the padded image run is the mask token count rounded up, and the
+    caption is whatever remains. That same invariant doubles as the
+    validity check: a real joint [cap, img] sequence must leave a caption
+    that is itself a multiple of the granularity. Anything else — a
+    refiner pass, a reference-image sequence — fails it and is declined,
+    which is what kept this from being guessed wrong before (the
+    pre-2026-08-03 code inferred the caption by subtracting the *unpadded*
+    mask count and silently displaced every region).
+    """
+    raw = int(mask_token_count)
+    mult = int(pad_tokens_multiple) if pad_tokens_multiple else 0
+
+    def provider(transformer_options, seqlen) -> Optional[Tuple[int, int, int]]:
+        img_len = raw
+        if mult > 1:
+            rounded = -(-raw // mult) * mult
+            if rounded <= seqlen:
+                img_len = rounded
+        cap_len = seqlen - img_len
+        if cap_len <= 0:
+            return None
+        if mult > 1 and cap_len % mult:
+            return None  # not the joint sequence this bias describes
+        return cap_len, img_len, raw
+
+    return provider
 
 
 class FreeFuseAttentionOverride:
@@ -130,11 +167,6 @@ class FreeFuseAttentionOverride:
         if heads is None:
             return self._skip("heads not resolvable", func, args, kwargs)
 
-        lengths = self.cap_len_provider(to)
-        if lengths is None:
-            return self._skip("sequence lengths unavailable", func, args, kwargs)
-        cap_len, img_len = lengths
-
         # normalise to (B, H, S, D)
         if skip_reshape:
             if q.dim() != 4:
@@ -151,6 +183,11 @@ class FreeFuseAttentionOverride:
             v = v.view(b, -1, v.shape[-1] // dim_head, dim_head).transpose(1, 2)
             qh, kh = q.shape[1], k.shape[1]
 
+        lengths = self.cap_len_provider(to, s)
+        if lengths is None:
+            return self._skip("sequence lengths unavailable", func, args, kwargs)
+        cap_len, img_len, real_img_len = lengths
+
         if s != cap_len + img_len:
             # refiner blocks, reference-image passes, anything whose
             # sequence is not the joint [cap, img] the masks describe
@@ -166,7 +203,8 @@ class FreeFuseAttentionOverride:
             v = v.repeat_interleave(rep, dim=1)
 
         try:
-            score_mod = self.cache.get(cap_len, img_len, q.device)
+            score_mod = self.cache.get(cap_len, img_len, q.device,
+                                       real_img_len=real_img_len)
         except RuntimeError as e:
             # adapter-count ceiling and mask/length mismatches land here;
             # falling back keeps the render alive and says why, loudly
@@ -253,7 +291,38 @@ def apply_freefuse_attention_override(
     return host
 
 
+def apply_zimage_attention_override(
+    model,
+    lora_masks: Dict[str, torch.Tensor],
+    token_pos_maps: Dict[str, List[List[int]]],
+    config,
+    layer_indices: Sequence[int],
+    latent_size: Optional[Tuple[int, int]] = None,
+    pad_tokens_multiple: Optional[int] = None,
+) -> Optional[FreeFuseAttentionOverride]:
+    """Z-Image consumer: same host, only the length source differs.
+
+    Lumina publishes no lengths in transformer_options, but it pads both
+    runs to a known multiple, so the lengths are recoverable arithmetically
+    from the mask token count — no capture hook, unlike the Krea 2 flex
+    path's `txtfusion` forward hook.
+    """
+    first = next((m for n, m in lora_masks.items() if not n.startswith("_")),
+                 None)
+    if first is None:
+        return None
+    mask_tokens = int(first.reshape(-1).numel())
+    return apply_freefuse_attention_override(
+        model, lora_masks=lora_masks, token_pos_maps=token_pos_maps,
+        config=config, block_indices=layer_indices, latent_size=latent_size,
+        cap_len_provider=make_padded_length_provider(mask_tokens,
+                                                     pad_tokens_multiple),
+    )
+
+
 __all__ = [
     "FreeFuseAttentionOverride",
     "apply_freefuse_attention_override",
+    "apply_zimage_attention_override",
+    "make_padded_length_provider",
 ]

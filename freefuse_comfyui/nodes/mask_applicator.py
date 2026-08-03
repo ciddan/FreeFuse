@@ -309,20 +309,38 @@ When enabled, constructs soft attention bias to guide cross-attention:
             zimage_layers = resolve_zimage_bias_layers(
                 self._get_diffusion_model(model_patcher), bias_blocks)
 
-            apply_zimage_bias_patches(
+            zimage_pad_mult = getattr(
+                self._get_diffusion_model(model_patcher),
+                "pad_tokens_multiple", None)
+            # Prefer comfy's attention override (family-agnostic, never
+            # reimplements the model's attention block); fall back to the
+            # per-call dense hooks.
+            from ..freefuse_core.attention_override import (
+                apply_zimage_attention_override)
+            zimage_host = apply_zimage_attention_override(
                 model_patcher,
                 lora_masks=lora_masks_flat,
                 token_pos_maps=token_pos_maps,
                 config=config,
                 layer_indices=zimage_layers,
-                pad_tokens_multiple=getattr(
-                    self._get_diffusion_model(model_patcher),
-                    "pad_tokens_multiple", None),
+                latent_size=latent_size,
+                pad_tokens_multiple=zimage_pad_mult,
             )
+            if zimage_host is None:
+                apply_zimage_bias_patches(
+                    model_patcher,
+                    lora_masks=lora_masks_flat,
+                    token_pos_maps=token_pos_maps,
+                    config=config,
+                    layer_indices=zimage_layers,
+                    pad_tokens_multiple=zimage_pad_mult,
+                )
             print(f"[FreeFuse] Applied attention bias for Z-Image "
                   f"(bias_scale={bias_scale}, positive_scale={positive_bias_scale}, "
                   f"bidirectional={bidirectional}, img_seq={img_seq_len}, "
-                  f"blocks={bias_blocks} -> {len(zimage_layers)} layers, per-call hooks)")
+                  f"blocks={bias_blocks} -> {len(zimage_layers)} layers, "
+                  + ("attn-override)" if zimage_host is not None
+                     else "per-call hooks)"))
 
         elif model_type == "krea2":
             # Krea2 is single-stream, [txt, img] sequence (text FIRST, same as Z-Image's

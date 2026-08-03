@@ -212,17 +212,33 @@ class BiasVectorCache:
     def adapter_count(self) -> int:
         return len([n for n in self.lora_masks if not n.startswith("_")])
 
-    def get(self, cap_len: int, img_len: int, device: torch.device) -> Callable:
+    def get(self, cap_len: int, img_len: int, device: torch.device,
+            real_img_len: Optional[int] = None) -> Callable:
+        """Build (or reuse) the score_mod for this sequence layout.
+
+        `real_img_len` is the count of genuine image tokens when the model
+        pads its image run (NextDiT/Z-Image). Masks are resized to that
+        count and the padding tail is ZERO-filled rather than stretched —
+        padding tokens belong to no character's region. When it is None or
+        equal to img_len (Krea 2, Flux) this is the plain resize as before.
+        """
         key = (int(cap_len), int(img_len))
         if self._key == key and self.score_mod is not None:
             return self.score_mod
         ensure_dynamo_limits()  # re-assert: other nodes clobber these
+        target = int(real_img_len) if real_img_len else img_len
+        pad = img_len - target
+        if pad < 0:
+            raise RuntimeError(
+                f"[FreeFuse flex] real_img_len {target} exceeds img_len {img_len}")
         masks = {
             name: resize_flat_mask(mask.reshape(-1).float(),
-                                   self.latent_size, img_len)
+                                   self.latent_size, target)
             for name, mask in self.lora_masks.items()
             if not name.startswith("_")
         }
+        if pad:
+            masks = {name: F.pad(m, (0, pad)) for name, m in masks.items()}
         self.vectors = build_bias_vectors(
             masks, self.token_pos_maps, key[0], key[1], device)
         self.score_mod = make_score_mod(self.vectors, self.config)
