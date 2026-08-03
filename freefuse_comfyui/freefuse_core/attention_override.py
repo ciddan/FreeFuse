@@ -175,7 +175,19 @@ class FreeFuseAttentionOverride:
         self.cache = BiasVectorCache(
             lora_masks, token_pos_maps, config, latent_size,
             log_prefix="[FreeFuse attn-override]")
-        self.blocks = {int(i) for i in block_indices}
+        # block_indices is either a flat iterable of indices (families with
+        # one block type) or {block_type: indices}. Flux needs the latter:
+        # it numbers double and single blocks BOTH from zero, so a flat set
+        # would bias single block 3 whenever double block 3 was selected.
+        if isinstance(block_indices, dict):
+            self.blocks_by_type = {
+                str(t): {int(i) for i in idx}
+                for t, idx in block_indices.items()
+            }
+            self.blocks = None
+        else:
+            self.blocks_by_type = None
+            self.blocks = {int(i) for i in block_indices}
         self.cap_len_provider = cap_len_provider or _lengths_from_img_slice
         self.previous_override = previous_override
         self.biased_calls = 0
@@ -204,9 +216,15 @@ class FreeFuseAttentionOverride:
             return self._skip("no transformer_options", func, args, kwargs)
 
         block_index = to.get("block_index")
-        if block_index is None or int(block_index) not in self.blocks:
+        if block_index is None:
             # includes the refiner/txt-fusion passes, which run before the
             # main loop publishes a block index
+            return self._skip("block not selected", func, args, kwargs)
+        if self.blocks_by_type is not None:
+            selected = self.blocks_by_type.get(str(to.get("block_type")))
+            if not selected or int(block_index) not in selected:
+                return self._skip("block not selected", func, args, kwargs)
+        elif int(block_index) not in self.blocks:
             return self._skip("block not selected", func, args, kwargs)
 
         if len(args) < 3:
@@ -345,9 +363,12 @@ def apply_freefuse_attention_override(
     )
     to["optimized_attention_override"] = host
     logging.info(
-        f"[FreeFuse attn-override] installed for blocks "
-        f"{min(host.blocks)}..{max(host.blocks)} ({len(host.blocks)} of them), "
-        f"{live} adapters — O(S) bias in comfy's attention override")
+        f"[FreeFuse attn-override] installed for "
+        + (", ".join(f"{len(v)} {t}" for t, v in host.blocks_by_type.items())
+           if host.blocks_by_type is not None
+           else f"blocks {min(host.blocks)}..{max(host.blocks)} "
+                f"({len(host.blocks)} of them)")
+        + f", {live} adapters — O(S) bias in comfy's attention override")
     return host
 
 
@@ -380,9 +401,75 @@ def apply_zimage_attention_override(
     )
 
 
+def apply_flux_attention_override(
+    model,
+    lora_masks: Dict[str, torch.Tensor],
+    token_pos_maps: Dict[str, List[List[int]]],
+    config,
+    latent_size: Optional[Tuple[int, int]] = None,
+) -> Optional[FreeFuseAttentionOverride]:
+    """Flux / Flux 2 consumer.
+
+    This is the family the dense path actually breaks on: every patched
+    block keeps its own (S, S) cache, so Klein 9B's 32 blocks cost ~15.6 GB
+    of bias alone at 4 MP and the confined continuation OOMs. Here it is a
+    handful of O(S) vectors.
+
+    Two Flux-specific details: double and single blocks are numbered from
+    zero independently, so selection is keyed by (block_type, index); and
+    `img_slice` is published only for single blocks, in Flux's own
+    [txt, img] form, so double blocks fall back to deriving the caption
+    length from the mask token count (Flux does not pad the sequence).
+    """
+    diffusion_model = model.model.diffusion_model
+    try:
+        n_double = len(diffusion_model.double_blocks)
+        n_single = len(diffusion_model.single_blocks)
+    except AttributeError:
+        logging.info("[FreeFuse attn-override] not a Flux block layout")
+        return None
+
+    by_type = {
+        "double": {i for i in range(n_double)
+                   if config.should_apply_to_block(f"transformer_blocks.{i}")},
+        "single": {i for i in range(n_single)
+                   if config.should_apply_to_block(
+                       f"single_transformer_blocks.{i}")},
+    }
+    if not by_type["double"] and not by_type["single"]:
+        logging.info("[FreeFuse attn-override] no Flux blocks selected")
+        return None
+
+    first = next((m for n, m in lora_masks.items() if not n.startswith("_")),
+                 None)
+    if first is None:
+        return None
+    arithmetic = make_padded_length_provider(int(first.reshape(-1).numel()),
+                                             None)
+
+    def provider(transformer_options, seqlen):
+        # single blocks publish img_slice; double blocks do not
+        got = _lengths_from_img_slice(transformer_options, seqlen)
+        return got if got is not None else arithmetic(transformer_options,
+                                                      seqlen)
+
+    host = apply_freefuse_attention_override(
+        model, lora_masks=lora_masks, token_pos_maps=token_pos_maps,
+        config=config, block_indices=by_type, latent_size=latent_size,
+        cap_len_provider=provider,
+    )
+    if host is not None:
+        logging.info(
+            f"[FreeFuse attn-override] Flux blocks selected: "
+            f"{len(by_type['double'])}/{n_double} double, "
+            f"{len(by_type['single'])}/{n_single} single")
+    return host
+
+
 __all__ = [
     "FreeFuseAttentionOverride",
     "apply_freefuse_attention_override",
     "apply_zimage_attention_override",
+    "apply_flux_attention_override",
     "make_padded_length_provider",
 ]

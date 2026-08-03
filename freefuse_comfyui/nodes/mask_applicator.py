@@ -271,17 +271,32 @@ When enabled, constructs soft attention bias to guide cross-attention:
             
             # Apply attention bias patches with dynamic bias construction
             # Bias will be built at runtime based on actual txt/img sequence lengths
-            apply_attention_bias_patches(
-                model_patcher=model_patcher,
-                attention_bias=None,  # Not used - bias built dynamically
-                config=config,
-                txt_seq_len=txt_seq_len,  # Estimate - actual determined at runtime
-                model_type="flux",
+            # Prefer comfy's attention override: the per-block dense caches
+            # below are the reason Flux 2 OOMs in a confined continuation
+            # (Klein 9B keeps one (S,S) tensor per patched block — ~15.6 GB
+            # across 32 blocks at 4 MP). The override is O(S).
+            from ..freefuse_core.attention_override import \
+                apply_flux_attention_override
+            flux_host = apply_flux_attention_override(
+                model_patcher,
                 lora_masks=lora_masks_flat,
                 token_pos_maps=token_pos_maps,
+                config=config,
+                latent_size=latent_size,
             )
+            if flux_host is None:
+                apply_attention_bias_patches(
+                    model_patcher=model_patcher,
+                    attention_bias=None,  # Not used - bias built dynamically
+                    config=config,
+                    txt_seq_len=txt_seq_len,  # Estimate - actual at runtime
+                    model_type="flux",
+                    lora_masks=lora_masks_flat,
+                    token_pos_maps=token_pos_maps,
+                )
             print(f"[FreeFuse] Applied attention bias for {model_type} "
-                  f"(bias_scale={bias_scale}, positive_scale={positive_bias_scale}, "
+                  f"({'attn-override' if flux_host is not None else 'dense'} path, "
+                  f"bias_scale={bias_scale}, positive_scale={positive_bias_scale}, "
                   f"bidirectional={bidirectional}, blocks={bias_blocks})")
         
         elif model_type == "z_image":
