@@ -95,6 +95,11 @@ class FreeFuseMaskApplicator:
                     "default": "double_stream_only",
                     "tooltip": "Which transformer blocks to apply attention bias. For Krea2, use all or last_half."
                 }),
+                "img_img_bias_scale": ("FLOAT", {
+                    "default": 0.0, "min": 0.0, "max": 20.0, "step": 0.5,
+                    "tooltip": "Cross-region self-attention isolation: negative bias between image tokens "
+                               "of different characters' regions. 0 = off (previous behavior)."
+                }),
             }
         }
     
@@ -128,6 +133,7 @@ When enabled, constructs soft attention bias to guide cross-attention:
         bidirectional=True,
         use_positive_bias=True,
         bias_blocks="double_stream_only",
+        img_img_bias_scale=0.0,
     ):
         # Extract data
         mask_dict = masks.get("masks", {})
@@ -198,6 +204,7 @@ When enabled, constructs soft attention bias to guide cross-attention:
                 bidirectional=bidirectional,
                 use_positive_bias=use_positive_bias,
                 bias_blocks=bias_blocks,
+                img_img_bias_scale=img_img_bias_scale,
             )
 
         return (model_clone,)
@@ -219,6 +226,7 @@ When enabled, constructs soft attention bias to guide cross-attention:
         bidirectional: bool,
         use_positive_bias: bool,
         bias_blocks: str,
+        img_img_bias_scale: float = 0.0,
     ):
         """Apply attention bias patches to the model."""
         # Create config
@@ -229,6 +237,7 @@ When enabled, constructs soft attention bias to guide cross-attention:
             bidirectional=bidirectional,
             use_positive_bias=use_positive_bias,
             apply_to_blocks=bias_blocks if bias_blocks != "all" else None,
+            img_img_bias_scale=img_img_bias_scale,
         )
         
         # Get sequence lengths
